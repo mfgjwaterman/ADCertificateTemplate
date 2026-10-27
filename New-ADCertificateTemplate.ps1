@@ -2,9 +2,9 @@
 #Requires -RunAsAdministrator
 <#
 .SYNOPSIS
-Creates an RSA certificate template in Active Directory from a version 1 or 2 template.
+Creates an RSA, ECDSA or ECDH certificate template from a version 1/2 RSA source.
 .DESCRIPTION
-Version 1.1.0. Creates a new OID registration and template, copies the source
+Version 1.2.0. Creates a new OID registration and template, copies the source
 DACL and its inheritance setting, and applies the selected settings. Never overwrites an existing template. With -Publish, publishes on the LOCAL
 enterprise CA after successful creation and verification.
 
@@ -17,9 +17,13 @@ enterprise CA. ADCSAdministration is no longer required for publication.
 No CA role is installed and no automatic reboot is performed.
 Windows servicing may require access to an approved component source.
 Local administrator membership does not grant AD or CA permissions.
-Validated sources: built-in WebServer and User. Other version 1/2 RSA sources
+RSA-validated sources: WebServer, User and KerberosAuthentication. Other sources
 require separate lab validation.
-RSA only in this release. KSP algorithms such as ECDSA are not implemented.
+Algorithms: RSA (default), plus ECDSA and ECDH on P-256/P-384/P-521. ECC
+requires KSP. ECDSA uses Signature purpose and Digital Signature key usage;
+ECDH uses Encryption purpose and Key Agreement usage, not Key Encipherment.
+Curve size is automatic unless explicitly supplied. EKUs/policies are retained;
+application interoperability must be validated separately.
 Provider names are not checked against the local machine: the enrollment
 client, not this management machine, must have the provider installed.
 
@@ -67,6 +71,7 @@ Unique internal template name (letters, digits, underscore, hyphen).
 Friendly template name displayed in the Certificate Templates console.
 .PARAMETER SourceTemplate
 Internal name of a version 1/2 RSA source template. Default: WebServer.
+Tab suggests the three lab-tested baselines, not an inventory of AD templates.
 .PARAMETER CACompatibility
 Certification Authority choice from the Compatibility tab.
 .PARAMETER RecipientCompatibility
@@ -78,11 +83,20 @@ AnyAvailable permits any provider in the selected category. SelectedProviders
 requires Provider and writes the ordered provider list with priorities 1, 2, ...
 .PARAMETER Provider
 Exact provider names, in preference order. Only with SelectedProviders.
+Tab completion lists local providers for the selected category. Names on remote
+enrollment clients can still be entered manually; suggestions are not validation.
+Fallback examples are labeled when local provider discovery is unavailable.
+.PARAMETER Algorithm
+RSA (default); ECDSA_P256/P384/P521 for signing; ECDH_P256/P384/P521 for
+key agreement. ECC requires KSP. Family-specific purpose and key usage are set
+automatically. Source EKUs are retained, not converted to a new application.
 .PARAMETER MinimumKeySize
-Minimum RSA key length: 1024, 2048, 3072, 4096, 8192 or 16384 bits. Default 3072.
+RSA: 1024, 2048, 3072, 4096, 8192 or 16384 bits; default 3072.
+ECC: omit for automatic 256/384/521 selection, or specify exactly the curve size.
 .PARAMETER RequestHash
-KSP request signature hash. Omit with legacy CSP (Determined by CSP).
-This is not the CA's certificate signature hash.
+KSP request hash, distinct from the CA certificate signature and ECDH KDF.
+Defaults: SHA256 (RSA/P-256), SHA384 (P-384), SHA512 (P-521). ECC accepts
+SHA256, SHA384 or SHA512; SHA1 is rejected. Omit for legacy CSP.
 .PARAMETER ValidityYears
 Validity in years of 365 days. Default: 1.
 .PARAMETER RenewalWeeks
@@ -96,14 +110,18 @@ Only valid with SupplyInRequest; does not grant Autoenroll rights.
 AD subject format: None, Common name, Fully distinguished name, DNS name,
 or E-mail name. Omit with SupplyInRequest.
 .PARAMETER SubjectAlternativeName
-AD SAN selections: DNS name, E-mail name, UPN, SPN, Directory GUID.
+AD SAN selections: DNS name, Domain DNS name, E-mail name, UPN, SPN, Directory GUID.
 Omit with SupplyInRequest. DNS-based enrollment requires a computer identity
-with dNSHostName and its own enrollment permissions.
+with dNSHostName and its own enrollment permissions. Domain DNS name sets
+CT_FLAG_SUBJECT_ALT_REQUIRE_DOMAIN_DNS; for a DC profile, combine it with
+DNS name. The CA obtains DNS-domain and NetBIOS-domain information from the
+requesting computer. The CA must be able to contact that computer for this lookup.
 .PARAMETER RequireManagerApproval
 CA certificate manager approval. Default false.
 .PARAMETER AllowPrivateKeyExport
 Allow private key to be exported for newly generated keys. Default false.
 .PARAMETER ApplicationPolicy
+Tab suggests the known friendly names; custom numeric OIDs remain accepted.
 Additional application policy OIDs or names: Client Authentication,
 Server Authentication, Code Signing, Secure Email, Time Stamping, OCSP Signing.
 .PARAMETER EnrollmentGroup
@@ -137,7 +155,7 @@ $settings = @{
 .EXAMPLE
 .\New-ADCertificateTemplate.ps1 -Name MWMultiSANUser01 -DisplayName 'MW Multi SAN User 01' -SourceTemplate User -SubjectNameMode ActiveDirectory -SubjectNameFormat 'Common name' -SubjectAlternativeName UPN,'E-mail name' -EnrollmentGroup 'GG-T0-Admins' -Publish
 .NOTES
-Version: 1.1.0
+Version: 1.2.0
 Use Get-Help -Full for parameters and examples. Without -Publish: creation only.
 Direct AD changes: validate resulting UI settings and enroll in a lab before production.
 #>
@@ -146,6 +164,18 @@ param(
     [Parameter(Mandatory)][ValidatePattern('^[A-Za-z][A-Za-z0-9_-]{0,63}$')]
     [string]$Name,
     [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$DisplayName,
+    [ArgumentCompleter({
+        param($commandName, $parameterName, $wordToComplete, $commandAst, $fakeBoundParameters)
+        $prefix = ([string]$wordToComplete).Trim([char[]]@([char]39,[char]34))
+        foreach ($value in @('WebServer','User','KerberosAuthentication')) {
+            if ($value.StartsWith($prefix,[StringComparison]::OrdinalIgnoreCase)) {
+                $quoted = "'" + $value.Replace("'", "''") + "'"
+                [System.Management.Automation.CompletionResult]::new(
+                    $quoted,$value,[System.Management.Automation.CompletionResultType]::ParameterValue,
+                    'Lab-tested RSA baseline; other version 1/2 source names can still be supplied.')
+            }
+        }
+    })]
     [ValidatePattern('^[A-Za-z][A-Za-z0-9_-]{0,63}$')][string]$SourceTemplate = 'WebServer',
     [ValidateSet('Windows Server 2003','Windows Server 2008','Windows Server 2008 R2',
         'Windows Server 2012','Windows Server 2012 R2','Windows Server 2016')]
@@ -157,8 +187,68 @@ param(
     [ValidateSet('Legacy Cryptographic Service Provider','Key Storage Provider')]
     [string]$ProviderCategory = 'Key Storage Provider',
     [ValidateSet('AnyAvailable','SelectedProviders')][string]$ProviderSelection = 'AnyAvailable',
+    [ArgumentCompleter({
+        param($commandName, $parameterName, $wordToComplete, $commandAst, $fakeBoundParameters)
+        # Completion is read-only and self-contained: the generator body is not run.
+        $category = 'Key Storage Provider'
+        if ($null -ne $fakeBoundParameters -and $fakeBoundParameters.ContainsKey('ProviderCategory') -and
+            $fakeBoundParameters['ProviderCategory'] -in 'Key Storage Provider','Legacy Cryptographic Service Provider') {
+            $category = [string]$fakeBoundParameters['ProviderCategory']
+        }
+        $wantLegacy = $category -eq 'Legacy Cryptographic Service Provider'
+        $names = [System.Collections.Generic.List[string]]::new()
+        $collection = $null
+        try {
+            $collection = New-Object -ComObject X509Enrollment.CCspInformations -ErrorAction Stop
+            $null = $collection.AddAvailableCsps()
+            for ($index = 0; $index -lt $collection.Count; $index++) {
+                $provider = $null
+                try {
+                    $provider = $collection.ItemByIndex($index)
+                    if ([bool]$provider.LegacyCsp -eq $wantLegacy -and
+                        -not [string]::IsNullOrWhiteSpace([string]$provider.Name)) {
+                        $names.Add([string]$provider.Name)
+                    }
+                }
+                catch { } # A provider with unreadable metadata is omitted.
+                finally {
+                    if ($null -ne $provider -and [Runtime.InteropServices.Marshal]::IsComObject($provider)) {
+                        try { $null = [Runtime.InteropServices.Marshal]::ReleaseComObject($provider) } catch { }
+                    }
+                }
+            }
+        }
+        catch { } # Completion must not interrupt input when COM discovery is unavailable.
+        finally {
+            if ($null -ne $collection -and [Runtime.InteropServices.Marshal]::IsComObject($collection)) {
+                try { $null = [Runtime.InteropServices.Marshal]::ReleaseComObject($collection) } catch { }
+            }
+        }
+        $origin = 'Locally installed'
+        if ($names.Count -eq 0) {
+            $origin = 'Common Windows example; local discovery unavailable'
+            if ($wantLegacy) {
+                $names.Add('Microsoft Enhanced RSA and AES Cryptographic Provider')
+                $names.Add('Microsoft Enhanced Cryptographic Provider v1.0')
+                $names.Add('Microsoft Strong Cryptographic Provider')
+                $names.Add('Microsoft Base Cryptographic Provider v1.0')
+            }
+            else { $names.Add('Microsoft Software Key Storage Provider') }
+        }
+        $prefix = ([string]$wordToComplete).Trim([char[]]@([char]39,[char]34))
+        $kind = if ($wantLegacy) { 'Legacy CSP' } else { 'KSP' }
+        foreach ($name in @($names | Sort-Object -Unique)) {
+            if ($name.StartsWith($prefix,[StringComparison]::OrdinalIgnoreCase)) {
+                $quoted = "'" + $name.Replace("'", "''") + "'"
+                $tip = "$origin $kind. Use SelectedProviders; verify availability and algorithm support on enrollment clients."
+                [System.Management.Automation.CompletionResult]::new(
+                    $quoted,$name,[System.Management.Automation.CompletionResultType]::ParameterValue,$tip)
+            }
+        }
+    })]
     [ValidateNotNullOrEmpty()][string[]]$Provider,
-    [ValidateSet(1024,2048,3072,4096,8192,16384)][int]$MinimumKeySize = 3072,
+    [ValidateSet('RSA','ECDSA_P256','ECDSA_P384','ECDSA_P521','ECDH_P256','ECDH_P384','ECDH_P521')][string]$Algorithm = 'RSA',
+    [ValidateSet(256,384,521,1024,2048,3072,4096,8192,16384)][int]$MinimumKeySize = 3072,
     [ValidateSet('SHA1','SHA256','SHA384','SHA512')][string]$RequestHash = 'SHA256',
     [ValidateRange(1,100)][int]$ValidityYears = 1,
     [ValidateRange(1,5200)][int]$RenewalWeeks,
@@ -166,10 +256,22 @@ param(
     [bool]$ReuseSubjectOnRenewal = $false,
     [ValidateSet('None','Common name','Fully distinguished name','DNS name','E-mail name')]
     [string]$SubjectNameFormat,
-    [ValidateSet('DNS name','E-mail name','UPN','SPN','Directory GUID')]
+    [ValidateSet('DNS name','Domain DNS name','E-mail name','UPN','SPN','Directory GUID')]
     [string[]]$SubjectAlternativeName,
     [bool]$RequireManagerApproval = $false,
     [bool]$AllowPrivateKeyExport = $false,
+    [ArgumentCompleter({
+        param($commandName, $parameterName, $wordToComplete, $commandAst, $fakeBoundParameters)
+        $prefix = ([string]$wordToComplete).Trim([char[]]@([char]39,[char]34))
+        foreach ($value in @('Client Authentication','Server Authentication','Code Signing','Secure Email','Time Stamping','OCSP Signing')) {
+            if ($value.StartsWith($prefix,[StringComparison]::OrdinalIgnoreCase)) {
+                $quoted = "'" + $value.Replace("'", "''") + "'"
+                [System.Management.Automation.CompletionResult]::new(
+                    $quoted,$value,[System.Management.Automation.CompletionResultType]::ParameterValue,
+                    'Adds this purpose to the source policies. A valid numeric OID can also be entered.')
+            }
+        }
+    })]
     [ValidateNotNullOrEmpty()][string[]]$ApplicationPolicy,
     [ValidateNotNullOrEmpty()][string[]]$EnrollmentGroup,
     [ValidateSet('Enroll','EnrollAndAutoenroll')][string]$EnrollmentPermission = 'Enroll',
@@ -307,6 +409,25 @@ $clientVersions = @('Windows XP / Windows Server 2003','Windows Vista / Windows 
 $caCode = [array]::IndexOf($caVersions, $CACompatibility) + 1
 $clientCode = [array]::IndexOf($clientVersions, $RecipientCompatibility) + 1
 $isKsp = $ProviderCategory -eq 'Key Storage Provider'
+$Algorithm = $Algorithm.ToUpperInvariant()
+$isEcc = $Algorithm -ne 'RSA'
+$isEcdsa = $Algorithm -like 'ECDSA_*'
+$isEcdh = $Algorithm -like 'ECDH_*'
+if ($isEcc) {
+    if (-not $isKsp) { throw 'ECC requires ProviderCategory Key Storage Provider.' }
+    $curveSize = [int]($Algorithm.Split('_')[1].Substring(1))
+    if ($PSBoundParameters.ContainsKey('MinimumKeySize') -and $MinimumKeySize -ne $curveSize) {
+        throw "Algorithm $Algorithm requires MinimumKeySize $curveSize (or omit MinimumKeySize)."
+    }
+    $MinimumKeySize = $curveSize
+    if (-not $PSBoundParameters.ContainsKey('RequestHash')) {
+        $RequestHash = @{256='SHA256';384='SHA384';521='SHA512'}[$curveSize]
+    }
+    if ($RequestHash -eq 'SHA1') { throw 'ECC profiles in this release require a SHA2 request hash.' }
+}
+elseif ($MinimumKeySize -notin 1024,2048,3072,4096,8192,16384) {
+    throw 'RSA MinimumKeySize must be 1024, 2048, 3072, 4096, 8192 or 16384.'
+}
 
 if ($isKsp -and ($caCode -lt 2 -or $clientCode -lt 2)) {
     throw 'Key Storage Provider requires at least CA Windows Server 2008 and recipient Windows Vista.'
@@ -391,7 +512,7 @@ if (Get-ADObject -Server $DC -SearchBase $templateContainer -SearchScope OneLeve
 $source = Get-ADObject -Server $DC -Identity "CN=$SourceTemplate,$templateContainer" -Properties *
 $sourceVersion = [int](Get-AttributeValue $source 'msPKI-Template-Schema-Version')
 if ($sourceVersion -notin 1,2) {
-    throw 'Version 1.1 supports version 1/2 RSA source templates only (baseline: WebServer).'
+    throw 'The creator supports version 1/2 RSA source templates only (baseline: WebServer). Use export/import for custom KSP sources.'
 }
 $forestOidObject = Get-ADObject -Server $DC -Identity $oidContainer -Properties 'msPKI-Cert-Template-OID'
 $forestOid = [string]$forestOidObject.'msPKI-Cert-Template-OID'
@@ -433,6 +554,15 @@ if ($schemaVersion -eq 4 -and ($caCode -lt 4 -or $clientCode -lt 4)) {
 }
 
 $privateFlags = [int]$attributes['msPKI-Private-Key-Flag']
+if ($isEcc) {
+    if (($privateFlags -band 1) -ne 0) {
+        throw 'ECC profiles requiring private-key archival are outside this release scope.'
+    }
+    $attributes['pKIDefaultKeySpec'] = if ($isEcdh) { 1 } else { 2 }
+    # ECDH is key agreement, not RSA-style key encipherment.
+    if ($isEcdh) { $attributes['pKIKeyUsage'] = [byte[]]@(0x08,0x00) }
+    else { $attributes['pKIKeyUsage'] = [byte[]]@(0x80,0x00) }
+}
 $privateFlags = ($privateFlags -band (-bnot (0x000F0000 -bor 0x0F000000))) -bor
     ($caCode -shl 16) -bor ($clientCode -shl 24)
 if ($AllowPrivateKeyExport) { $privateFlags = $privateFlags -bor 0x10 }
@@ -441,9 +571,12 @@ if ($isKsp) {
     $privateFlags = $privateFlags -band (-bnot 0x100)
     # Convert the source's RA policies to the KSP property-triplet syntax.
     $raPolicies = @(Get-StringValues (Get-AttributeValue $source 'msPKI-RA-Application-Policies'))
-    $crypto = 'msPKI-Asymmetric-Algorithm`PZPWSTR`RSA`' +
+    # Match certtmpl.msc for ECDH: restricting CNG to agreement-only caused
+    # NTE_PERM during enrollment in the lab. Certificate usage stays Key Agreement.
+    $cngKeyUsage = if ($isEcdh) { 0x00FFFFFF } elseif ($isEcdsa) { 2 } else { 3 }
+    $crypto = 'msPKI-Asymmetric-Algorithm`PZPWSTR`' + $Algorithm + '`' +
         'msPKI-Hash-Algorithm`PZPWSTR`' + $RequestHash + '`' +
-        'msPKI-Key-Usage`DWORD`3`'
+        'msPKI-Key-Usage`DWORD`' + $cngKeyUsage + '`'
     if ($raPolicies.Count -gt 0) {
         $crypto += 'msPKI-RA-Application-Policies`PZPWSTR`' + ($raPolicies -join ',') + '`'
     }
@@ -484,7 +617,7 @@ if ($SubjectNameMode -eq 'SupplyInRequest') {
 else {
     $formatFlags = @{'None'=0; 'Common name'=0x40000000;
         'Fully distinguished name'=-2147483648; 'DNS name'=0x10000000; 'E-mail name'=0x20000000}
-    $sanFlags = @{'DNS name'=0x08000000; 'E-mail name'=0x04000000;
+    $sanFlags = @{'DNS name'=0x08000000; 'Domain DNS name'=0x00400000; 'E-mail name'=0x04000000;
         'UPN'=0x02000000; 'SPN'=0x00800000; 'Directory GUID'=0x01000000}
     $nameFlags = [int]$formatFlags[$SubjectNameFormat]
     foreach ($san in $SubjectAlternativeName) { $nameFlags = $nameFlags -bor $sanFlags[$san] }
@@ -588,7 +721,7 @@ $attributes['msPKI-Template-Schema-Version'] = $schemaVersion
 $attributes['msPKI-Template-Minor-Revision'] = 0
 $attributes['revision'] = 1
 
-Write-Verbose "Prepared $Name; schema $schemaVersion; $ProviderCategory; RSA $MinimumKeySize; validity $($validity.TotalDays) days."
+Write-Verbose "Prepared $Name; schema $schemaVersion; $ProviderCategory; $Algorithm $MinimumKeySize; validity $($validity.TotalDays) days."
 $createApproved = $PSCmdlet.ShouldProcess($targetDN, 'Create OID and certificate template, apply settings and source permissions')
 if (-not $createApproved) {
     if ($Publish -and $WhatIfPreference) {
@@ -640,7 +773,7 @@ try {
     }
     if ($saved.DisplayName -cne $DisplayName) { throw 'Display name read-back verification failed.' }
     $result = [PSCustomObject]@{
-        ScriptVersion = '1.1.0'
+        ScriptVersion = '1.2.0'
         Name = $saved.Name
         DisplayName = $saved.DisplayName
         DistinguishedName = $saved.DistinguishedName
@@ -652,7 +785,8 @@ try {
         ProviderCategory = $ProviderCategory
         ProviderSelection = $ProviderSelection
         Providers = @(Get-StringValues $Provider)
-        Algorithm = 'RSA'
+        Algorithm = $Algorithm
+        KeyPurpose = $(if ($isEcdh) { 'Encryption (key agreement)' } elseif ($isEcdsa) { 'Signature' } else { 'Source settings' })
         MinimumKeySize = $MinimumKeySize
         RequestHash = $(if ($isKsp) { $RequestHash } else { 'Determined by CSP' })
         ValidityDays = $validity.TotalDays

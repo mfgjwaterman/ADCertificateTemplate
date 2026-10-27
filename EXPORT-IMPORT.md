@@ -1,4 +1,4 @@
-# AD Certificate Template Export / Import — v1.1.0
+# AD Certificate Template Export / Import — v1.2.0
 
 Companion tools for the tested New-ADCertificateTemplate script. They do not
 modify that script or existing templates. Unzip the entire folder: the shared
@@ -8,8 +8,8 @@ modify that script or existing templates. Unzip the entire folder: the shared
 in the Windows lab: export, WhatIf, Preserve import, UI settings and group
 Read/Enroll permissions, manual CA publication, certificate enrollment, then
 removal through certtmpl.msc with both template and OID registration confirmed
-absent. This is one validated import profile, not a claim that every supported
-combination has been exercised. Cross-forest and TargetBaseline still need
+absent. The Kerberos RSA profile also passed export/import and enrollment after the
+KDC OID correction; this does not establish every supported combination. Cross-forest and TargetBaseline still need
 separate lab tests. The local PowerShell regression suite is included; it was
 not executed in the build environment.
 
@@ -44,14 +44,16 @@ not disaster recovery or an update operation. Existing names cause a stop.
 
 - Custom schema version **2, 3 and 4 RSA** templates, especially the profiles
   created with our companion script.
-- Both legacy CSP and RSA KSP configuration. KSP must explicitly declare RSA.
+- Legacy CSP and RSA KSP configuration, plus schema 3/4 ECDSA/ECDH
+  profiles on P-256/P-384/P-521. KSP must explicitly declare a supported algorithm.
 - Built-in version 1 templates must first be duplicated/configured as a custom
   template. This tool does not perform that version conversion.
 - An explicit allowlist is used. Unknown populated PKI attributes stop export;
   unknown import attributes are rejected instead of being silently ignored.
 - The internal-use `pKIEnrollmentAccess` field is not supported. Populated values
   cause export to stop. Extra schema fields need an intentional future extension.
-- This release transports the configuration; it does not introduce ECC support.
+- ECC support is limited to the exact family-specific profiles in
+  ALGORITHMS.md; arbitrary mixed purposes/usages are rejected.
 
 ## Requirements
 
@@ -67,17 +69,7 @@ issuance-list verification sequence. ADCSAdministration is not required.
 
 `-WhatIf` performs reads and validation but does not install, create, write or
 publish. Without installed AD tools, it reports that directory validation cannot
-proceed. The purely local regression script needs no AD connection or elevation.
-
-## First: local format regression checks
-
-```powershell
-.\Test-ADTemplatePortability.ps1
-```
-
-This verifies typed JSON round trips, binary periods, signed flags, single-value
-arrays, attribute rejection, corrupt values, and DACL comparisons. It does not
-connect to AD or create any templates/files. A failed assertion terminates.
+proceed. Development regression scripts are not included in this release archive.
 
 ## Step 1: export an existing lab template
 
@@ -210,29 +202,21 @@ HSM software, smart-card middleware, GPOs, CA trust, or enrollment services.
   creation error.
 - Deleting or importing templates does not revoke previously issued certificates.
 
-## Suggested live test order
+## Algorithm validation and upgrade
 
-1. Local regression script, then export MWWebServerProd; inspect the JSON.
-2. Same-forest Preserve import under a new name; verify different OID and identical
-   settings/permissions; publish and enroll.
-3. Export a computer autoenrollment profile; import with Preserve; verify DNS
-   subject/SAN and actual computer autoenrollment.
-4. Export the User UPN/email multi-SAN profile; import with Preserve; verify both
-   SAN types and retained EKUs on a new user certificate.
-5. Import using TargetBaseline and another enrollment group; verify the source
-   custom group is absent unless it also exists in the chosen baseline DACL.
-6. Repeat import with the same name: expect a stop without modifying the existing
-   object. Test WhatIf and malformed JSON separately.
-7. Only after those pass: test a second forest using TargetBaseline, target groups
-   and any required custom policy registrations.
+Supported ECC profiles are listed in ALGORITHMS.md. ECDSA uses KeySpec 2,
+Digital Signature certificate usage and CNG Signing 2. ECDH uses KeySpec 1,
+Key Agreement certificate usage and CNG AllUsages 16777215. Curve sizes and
+explicit SHA2 request hashes are validated; mixed profiles are rejected.
 
-First test the existing RSA configurations. Full algorithm expansion, arbitrary
-schema support, in-place updates, backup/restore retaining template identity,
-bulk imports and explicit SID mappings are separate future work.
+Earlier ECDH candidate exports with CNG value 4 are rejected. Correct the source
+and re-export, or create a new template; imports do not silently rewrite the
+configuration or its checksum. JSON FormatVersion remains 1.0.
 
-Help:
+KDC Authentication (1.3.6.1.5.2.3.5) is recognized as a standard policy without
+requiring custom OID registration in AD. This exact exception does not apply
+to child OIDs. Other custom policy dependencies must exist in the destination.
 
-```powershell
-Get-Help .\Export-ADCertificateTemplate.ps1 -Full
-Get-Help .\Import-ADCertificateTemplate.ps1 -Full
-```
+The lab validated same-forest Preserve imports through issuance and actual
+key agreement for ECDH P-256/P-384/P-521. See README.md for other results and
+limits. Development regression scripts and test plans are not included.

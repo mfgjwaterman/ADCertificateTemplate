@@ -4,7 +4,7 @@
 .SYNOPSIS
 Exports a custom AD CS certificate template to a typed, reviewable JSON file.
 .DESCRIPTION
-Version 1.1.0. Initial scope: custom schema 2/3/4 RSA templates, including those
+Version 1.2.0. Initial scope: custom schema 2/3/4 RSA and schema 3/4 ECDSA/ECDH P-256/P-384/P-521 templates, including those
 created with New-ADCertificateTemplate. Exports configuration and a DACL snapshot;
 no certificates/private keys and no CA publication state. Source identity/OID
 and revisions are metadata only. Unknown populated PKI attributes cause a stop.
@@ -51,10 +51,11 @@ $renewalTicks = [BitConverter]::ToInt64([byte[]]$decoded['pKIOverlapPeriod'],0)
 $schema = [int]$decoded['msPKI-Template-Schema-Version']
 $privateFlags = [int]$decoded['msPKI-Private-Key-Flag']
 $legacy = ($schema -eq 2) -or (($privateFlags -band 0x100) -ne 0)
+$crypto = Get-CTCryptography -Attributes $decoded
 $configuration = [ordered]@{
     Format = 'ADCertificateTemplate.Configuration'
     FormatVersion = '1.0'
-    ExporterVersion = '1.1.0'
+    ExporterVersion = '1.2.0'
     ExportedAtUtc = [datetime]::UtcNow.ToString('o')
     Source = [ordered]@{
         Name = $template.Name
@@ -71,6 +72,8 @@ $configuration = [ordered]@{
     SummaryForReview = [ordered]@{
         SchemaVersion = $schema
         ProviderCategory = $(if ($legacy) { 'Legacy Cryptographic Service Provider' } else { 'Key Storage Provider' })
+        Algorithm = $crypto.Algorithm
+        RequestHash = $crypto.RequestHash
         MinimumKeySize = [int]$decoded['msPKI-Minimal-Key-Size']
         ValidityDays = [TimeSpan]::FromTicks(-$validityTicks).TotalDays
         RenewalDays = [TimeSpan]::FromTicks(-$renewalTicks).TotalDays
@@ -92,7 +95,7 @@ try {
 }
 finally { $stream.Dispose() }
 [PSCustomObject]@{
-    ExporterVersion = '1.1.0'
+    ExporterVersion = '1.2.0'
     Template = $template.Name
     Path = $fullPath
     SHA256 = (Get-FileHash -LiteralPath $fullPath -Algorithm SHA256).Hash

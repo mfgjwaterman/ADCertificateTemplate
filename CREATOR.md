@@ -1,6 +1,6 @@
-# New-ADCertificateTemplate — version 1.1.0
+# New-ADCertificateTemplate — version 1.2.0
 
-Creates an RSA certificate template in Active Directory from a version 1/2
+Creates an RSA, ECDSA or ECDH certificate template in Active Directory from a version 1/2
 source. It registers a unique template OID, copies the source DACL and inheritance
 setting, applies the selected settings and verifies the saved configuration.
 Optional publication uses `certutil` on the local enterprise CA.
@@ -61,20 +61,21 @@ $settings.DisplayName = 'MW Web Server 02'
 |---|---|---|
 | `Name` | Unique internal name; starts with a letter; letters, digits, `_`, `-`; max 64 characters | Required |
 | `DisplayName` | Template display name | Required |
-| `SourceTemplate` | Internal name of a version 1/2 RSA source; WebServer and User validated | WebServer |
+| `SourceTemplate` | Internal name of a version 1/2 RSA source; WebServer, User and KerberosAuthentication validated | WebServer |
 | `CACompatibility` | UI labels listed below | Windows Server 2012 R2 |
 | `RecipientCompatibility` | UI labels listed below | Windows 10 / Windows Server 2016 |
 | `ProviderCategory` | `Legacy Cryptographic Service Provider`, `Key Storage Provider` | Key Storage Provider |
 | `ProviderSelection` | `AnyAvailable`, `SelectedProviders` | AnyAvailable |
 | `Provider` | One or more exact provider names in preference order; required only for SelectedProviders | None |
-| `MinimumKeySize` | 1024, 2048, 3072, 4096, 8192, 16384 bits | 3072 |
-| `RequestHash` | SHA1, SHA256, SHA384, SHA512; omit for legacy CSP | SHA256 for KSP |
+| `Algorithm` | RSA; ECDSA/ECDH on P-256/P-384/P-521; ECC requires KSP | RSA |
+| `MinimumKeySize` | RSA: 1024–16384 from the supported list; ECC: 256, 384 or 521 matching its curve | RSA 3072; ECC derives curve size |
+| `RequestHash` | RSA KSP: SHA1/SHA2; ECC: SHA256/SHA384/SHA512; omit for legacy CSP | SHA256; P-384 SHA384; P-521 SHA512 |
 | `ValidityYears` | Integer 1–100; a year is encoded as 365 days | 1 |
 | `RenewalWeeks` | Integer 1–5200; must be positive and less than validity | Inherited from source |
 | `SubjectNameMode` | `SupplyInRequest`, `ActiveDirectory` | SupplyInRequest |
 | `ReuseSubjectOnRenewal` | Boolean; use existing Subject/SAN for autoenrollment renewals; SupplyInRequest only | False |
 | `SubjectNameFormat` | `None`, `Common name`, `Fully distinguished name`, `DNS name`, `E-mail name`; AD mode only | Required in AD mode |
-| `SubjectAlternativeName` | Array: `DNS name`, `E-mail name`, `UPN`, `SPN`, `Directory GUID`; AD mode only | None |
+| `SubjectAlternativeName` | Array: `DNS name`, `Domain DNS name`, `E-mail name`, `UPN`, `SPN`, `Directory GUID`; AD mode only | None |
 | `RequireManagerApproval` | Boolean: CA certificate manager approval | False |
 | `AllowPrivateKeyExport` | Boolean: allow export of newly generated private keys | False |
 | `ApplicationPolicy` | Additional friendly policy names or dotted OIDs; existing policies retained | No additions |
@@ -240,96 +241,35 @@ certutil -config 'CAHOST\CAName' -CATemplates ExistingTemplateName
 Existing templates are never overwritten. This is a creation tool, not an update,
 remove or template-publication-only command.
 
-## Validation record
+## Domain DNS names for Kerberos templates
 
-The user reported successful lab validation of these scenarios across versions
-0.2.0–0.2.2. Version 1.0.0 changes documentation and release strings only.
+In ActiveDirectory mode, `-SubjectAlternativeName 'DNS name','Domain DNS name'`
+requests host DNS plus domain DNS/NetBIOS names. With SubjectNameFormat None,
+name flags are 0x08400000; with DNS name as the subject format, 0x18400000.
+Use the computer enrollment context and appropriate Read/Enroll permissions.
+Both subject variants and imported-template issuance passed in the lab.
 
-| Scenario | Observed result |
-|---|---|
-| 1: KSP defaults | Creation, AD read-back, UI and enrollment successful; missing AD tools installed; WhatIf did not install |
-| 2: selected Software KSP + Client Authentication | Successful; Server and Client policies present |
-| 3: legacy CSP, any provider | Successful creation/UI/enrollment |
-| 4: legacy selected provider, CA2003/XP, schema2 | Successful, including certutil publication |
-| 5: KSP, CA2008/Vista, schema3 | Reported validated in the scenario sequence |
-| 6: RSA4096/SHA384, 2 years, approval/export/reuse | Configuration and enrollment reported successful; actual renewal not separately tested |
-| 7: computer DNS subject/SAN + autoenrollment | Successful after DACL comparison patch 0.2.1 |
-| 8: User source, Common name/UPN | Successful; Secure Email, Client Authentication and EFS retained |
-| 9: policy addition/deduplication, RSA4096/SHA512, 3 years | Configuration and certificate issuance observed; original CSR hash not independently inspected |
-| 10: local publication | Add-CATemplate failed; replacement certutil route in 0.2.2 created, published and verified successfully; enrollment confirmed |
-| Additional: AD UPN + email SANs | Successful |
-| Additional: three request-supplied DNS SANs | Successful |
+The generator applies its parameter defaults; selecting a source is not a
+promise to preserve every source setting unchanged. Review with -WhatIf and
+inspect the created template before publishing.
 
-The template name eventually appeared in the client UI without a code change.
-No forced OID-cache refresh has been added. The precise cause of the earlier
-Add-CATemplate discovery failure remains unproven.
+## ECC and parameter completion
 
-Separate validation remains for actual subject reuse during renewal, CSR hash
-inspection, the full invalid-input matrix, dependency installation on Windows
-clients, and other source templates/providers. Source permission handling with
-Deny or inherited ACEs was not covered by the successful allow-only baseline.
+See ALGORITHMS.md for all curve sizes, hashes, purpose and usage mappings.
+RSA remains the default. ECDH uses CNG AllUsages 16777215 while the issued
+certificate Key Usage remains Key Agreement only. Existing templates are not
+changed when replacing these files.
 
-The issued certificate lifetime can be shorter than the template lifetime due
-to CA policy or remaining CA certificate validity. Compatibility was configured
-and tested using the available lab systems; this does not establish enrollment
-interoperability on actual Windows XP/Vista or Server2003/2008 machines.
+Use Tab or Ctrl+Space after parameter names to see choices. Provider discovery
+uses the local machine, not the eventual enrollment client. Manual provider
+names and numeric application policy OIDs remain accepted. See COMPLETION.md.
 
-## Repeat the scenario tests
+## Validation
 
-```powershell
-# Default: dry run of one selected scenario
-.\Test-ADCertificateTemplate.ps1 -TestNumber 1
-
-# Create using a fresh unique name for each repeated run
-.\Test-ADCertificateTemplate.ps1 -TestNumber 1 -RunId Final01 -Create
-
-# Scenario 7 requires a real computer group
-.\Test-ADCertificateTemplate.ps1 -TestNumber 7 -RunId Final01 `
-    -ComputerEnrollmentGroup 'GG-Lab-Certificate-Computers' -Create
-
-# Scenario 10 publishes; run on the local issuing enterprise CA
-.\Test-ADCertificateTemplate.ps1 -TestNumber 10 -RunId Final01 -Create
-```
-
-Scenarios 1–9 require separate publication before enrollment. The test runner
-does not perform enrollment itself or automatically assert certificate contents.
-It prints the expected profile and invokes the creation script. Multiple SANs
-can be retested with the examples above.
+See README.md for the 27 October 2026 lab record and scope. The final runtime
+files retain the tested rc7 logic, with version strings changed to 1.2.0.
+Development tests and test plans are not part of this download.
 
 ```powershell
 Get-Help .\New-ADCertificateTemplate.ps1 -Full
 ```
-
-## Patch 1.0.1: forced discovery before publication
-
-The initial MWWebServerProd publication returned ERROR_NOT_FOUND / Invalid
-Template even though AD creation had succeeded. The following manual sequence
-then succeeded in the user's lab:
-
-1. `certutil -ADTemplate MWWebServerProd` returned success without a template.
-2. `certutil -f -ADTemplate MWWebServerProd` returned the actual template.
-3. `certutil -config <CA> -SetCATemplates "+MWWebServerProd"` published it.
-
-The script now performs steps 2 and 3 automatically, followed by its existing
-issuance-list verification. Failed discovery retains the verified template/OID
-and reports PublicationStatus Failed. No automatic CA restart, registry editing
-or blanket cache deletion is performed. The script filename remains unchanged.
-
-The integrated forced-discovery publication step was subsequently reported
-successful in the lab. Version 1.1.0 retains that implementation.
-
-## Version 1.1.0: OID object naming
-
-New OID registrations use the final OID arc, a dot, and the uppercase hexadecimal
-MD5 digest of the complete OID encoded as UTF-16LE, without a BOM or terminating
-NUL. The template OID remains newly generated under the destination forest base.
-The digest determines an LDAP object name; it does not select a certificate or
-request signature algorithm.
-
-The name matched a UI-created custom template. A newly created template was
-then removed through certtmpl.msc; both the template and its OID registration
-were confirmed absent. The importer passed the same cleanup test after a
-successful export/import, manual publication and enrollment.
-
-Existing registrations created with GUID names are not renamed or repaired.
-See README.md and CHANGELOG.md before adopting this release.

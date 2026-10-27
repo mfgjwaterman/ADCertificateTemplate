@@ -1,5 +1,5 @@
 #Requires -Version 5.1
-# Shared helpers for Export/Import-ADCertificateTemplate, version 1.1.0.
+# Shared helpers for Export/Import-ADCertificateTemplate, version 1.2.0.
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.DirectoryServices -ErrorAction Stop
@@ -196,6 +196,68 @@ function ConvertFrom-CTAttributes {
     return $result
 }
 
+function Get-CTKspProperties {
+    param([Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Value)
+    $parts = @($Value.Split([char]96))
+    if ($parts[-1] -eq '') { $parts = @($parts[0..($parts.Count - 2)]) }
+    if ($parts.Count -eq 0 -or ($parts.Count % 3) -ne 0) {
+        throw 'Malformed KSP property triplets.'
+    }
+    $properties = @{}
+    for ($index = 0; $index -lt $parts.Count; $index += 3) {
+        $name = $parts[$index]
+        if ([string]::IsNullOrWhiteSpace($name) -or $properties.ContainsKey($name)) {
+            throw "Empty or duplicate KSP property: $name"
+        }
+        $properties[$name] = [PSCustomObject]@{
+            Type = $parts[$index + 1]
+            Value = $parts[$index + 2]
+        }
+    }
+    return $properties
+}
+
+function Get-CTCryptography {
+    param([hashtable]$Attributes)
+    $legacy = ([int]$Attributes['msPKI-Template-Schema-Version'] -eq 2) -or
+        (([int]$Attributes['msPKI-Private-Key-Flag'] -band 0x100) -ne 0)
+    if ($legacy) {
+        foreach ($value in @($Attributes['msPKI-RA-Application-Policies'])) {
+            if ($null -ne $value -and ([string]$value).Contains('`')) {
+                $encoded = Get-CTKspProperties -Value ([string]$value)
+                if ($encoded.ContainsKey('msPKI-Asymmetric-Algorithm') -and
+                    $encoded['msPKI-Asymmetric-Algorithm'].Value -ne 'RSA') {
+                    throw 'Non-RSA KSP algorithms cannot be combined with a legacy provider/schema.'
+                }
+            }
+        }
+        return [PSCustomObject]@{
+            IsLegacy = $true; Algorithm = 'RSA'; RequestHash = 'Determined by CSP'
+            CngKeyUsage = $null; Properties = @{}
+        }
+    }
+    $policy = @($Attributes['msPKI-RA-Application-Policies'])
+    if ($policy.Count -ne 1 -or [string]::IsNullOrWhiteSpace([string]$policy[0])) {
+        throw 'KSP templates require one property-triplet string with an explicit algorithm.'
+    }
+    $properties = Get-CTKspProperties -Value ([string]$policy[0])
+    if (-not $properties.ContainsKey('msPKI-Asymmetric-Algorithm') -or
+        $properties['msPKI-Asymmetric-Algorithm'].Type -cne 'PZPWSTR') {
+        throw 'KSP templates require an explicit PZPWSTR asymmetric algorithm.'
+    }
+    return [PSCustomObject]@{
+        IsLegacy = $false
+        Algorithm = ([string]$properties['msPKI-Asymmetric-Algorithm'].Value).ToUpperInvariant()
+        RequestHash = $(if ($properties.ContainsKey('msPKI-Hash-Algorithm')) {
+            [string]$properties['msPKI-Hash-Algorithm'].Value
+        } else { $null })
+        CngKeyUsage = $(if ($properties.ContainsKey('msPKI-Key-Usage')) {
+            [string]$properties['msPKI-Key-Usage'].Value
+        } else { $null })
+        Properties = $properties
+    }
+}
+
 function Assert-CTConfiguration {
     param([hashtable]$Attributes)
     foreach ($name in @('flags','msPKI-Template-Schema-Version','msPKI-Minimal-Key-Size',
@@ -205,7 +267,6 @@ function Assert-CTConfiguration {
     }
     $schema = [int]$Attributes['msPKI-Template-Schema-Version']
     if ($schema -notin 2,3,4) { throw 'This release imports/exports custom schema version 2, 3 or 4 templates only.' }
-    if ([int]$Attributes['msPKI-Minimal-Key-Size'] -lt 512) { throw 'Invalid minimum key size.' }
     foreach ($name in @('pKIExpirationPeriod','pKIOverlapPeriod')) {
         if ($Attributes[$name].Length -ne 8) { throw "$name must contain exactly eight bytes." }
         $ticks = [BitConverter]::ToInt64([byte[]]$Attributes[$name],0)
@@ -214,14 +275,51 @@ function Assert-CTConfiguration {
     $validity = [BitConverter]::ToInt64([byte[]]$Attributes['pKIExpirationPeriod'],0)
     $renewal = [BitConverter]::ToInt64([byte[]]$Attributes['pKIOverlapPeriod'],0)
     if ($renewal -le $validity) { throw 'Renewal period must be shorter than validity.' }
-    # Initial scope: RSA configurations generated/tested by the companion script.
-    $legacy = ($schema -eq 2) -or (([int]$Attributes['msPKI-Private-Key-Flag'] -band 0x100) -ne 0)
-    if (-not $legacy) {
-        $policy = @($Attributes['msPKI-RA-Application-Policies'])
-        if ($policy.Count -ne 1 -or $policy[0] -notmatch '(^|`)msPKI-Asymmetric-Algorithm`PZPWSTR`RSA`') {
-            throw 'This initial release requires an explicit RSA algorithm in a KSP template.'
+    $crypto = Get-CTCryptography -Attributes $Attributes
+    $keySize = [int]$Attributes['msPKI-Minimal-Key-Size']
+    if ($crypto.Algorithm -eq 'RSA') {
+        if ($keySize -lt 512) { throw 'Invalid RSA minimum key size.' }
+    }
+    elseif ($crypto.Algorithm -match '^(ECDSA|ECDH)_P(256|384|521)$') {
+        $agreement = $Matches[1] -eq 'ECDH'
+        $expectedSize = [int]$Matches[2]
+        if ($crypto.IsLegacy) { throw 'ECC requires a KSP template.' }
+        if ($keySize -ne $expectedSize) {
+            throw "Algorithm $($crypto.Algorithm) requires minimum key size $expectedSize."
+        }
+        if (-not $crypto.Properties.ContainsKey('msPKI-Hash-Algorithm') -or
+            $crypto.Properties['msPKI-Hash-Algorithm'].Type -cne 'PZPWSTR' -or
+            $crypto.RequestHash -notin 'SHA256','SHA384','SHA512') {
+            throw 'ECC profiles require an explicit SHA2 request hash.'
+        }
+        # ECDH follows the UI's CNG AllUsages profile; the certificate extension
+        # below remains Key Agreement-only. Never silently repair an old export.
+        $expectedUsage = if ($agreement) { 16777215 } else { 2 }
+        $expectedSpec = if ($agreement) { 1 } else { 2 }
+        $expectedCertUsage = if ($agreement) { 0x08 } else { 0x80 }
+        [uint32]$cngUsage = 0
+        if (-not $crypto.Properties.ContainsKey('msPKI-Key-Usage') -or
+            $crypto.Properties['msPKI-Key-Usage'].Type -cne 'DWORD' -or
+            -not [uint32]::TryParse($crypto.CngKeyUsage, [ref]$cngUsage) -or $cngUsage -ne $expectedUsage) {
+            if ($agreement) {
+                throw "Algorithm $($crypto.Algorithm) requires CNG AllUsages DWORD 16777215. ECDH profiles from rc5/rc6 with value 4 must be corrected and re-exported; import does not rewrite configuration."
+            }
+            throw "Algorithm $($crypto.Algorithm) requires CNG key usage DWORD $expectedUsage."
+        }
+        if (-not $Attributes.ContainsKey('pKIDefaultKeySpec') -or
+            [int]$Attributes['pKIDefaultKeySpec'] -ne $expectedSpec) {
+            throw "Algorithm $($crypto.Algorithm) requires pKIDefaultKeySpec $expectedSpec."
+        }
+        $keyUsage = [byte[]]$Attributes['pKIKeyUsage']
+        if ($keyUsage.Length -notin 1,2 -or $keyUsage[0] -ne $expectedCertUsage -or
+            ($keyUsage.Length -eq 2 -and $keyUsage[1] -ne 0)) {
+            throw "Algorithm $($crypto.Algorithm) requires family-specific certificate Key Usage."
+        }
+        if (([int]$Attributes['msPKI-Private-Key-Flag'] -band 1) -ne 0) {
+            throw 'ECC profiles requiring private-key archival are outside this release scope.'
         }
     }
+    else { throw "Unsupported KSP algorithm: $($crypto.Algorithm). Supported: RSA or ECDSA/ECDH on P-256/P-384/P-521." }
     if (([int]$Attributes['flags'] -band 0x40000) -ne 0) { throw 'Deleted templates are not importable.' }
 }
 
@@ -348,7 +446,10 @@ function Assert-CTPolicyDependencies {
     foreach ($oid in @($oids | Sort-Object -Unique)) {
         if ($oid -notmatch '^[0-2](\.[0-9]+)+$') { throw "Invalid referenced policy OID: $oid" }
         # Standard and Microsoft-defined OIDs retain their meaning between forests.
-        if ($oid -match '^(1\.3\.6\.1\.5\.5\.7\.|1\.3\.6\.1\.4\.1\.311\.|2\.5\.)') { continue }
+        # RFC 4556: id-pkinit-KPKdc is outside the PKIX arc.
+        # Accept this exact KDC EKU, not the entire Kerberos OID subtree.
+        if ($oid -eq '1.3.6.1.5.2.3.5' -or
+            $oid -match '^(1\.3\.6\.1\.5\.5\.7\.|1\.3\.6\.1\.4\.1\.311\.|2\.5\.)') { continue }
         $registered = @(Get-ADObject -Server $Context.DC -SearchBase $Context.OIDContainer `
             -LDAPFilter "(msPKI-Cert-Template-OID=$oid)" -ErrorAction Stop)
         if ($registered.Count -eq 0) {

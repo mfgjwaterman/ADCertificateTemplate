@@ -1,121 +1,97 @@
-# AD Certificate Template Tools 1.1.0
+# AD Certificate Template Tools 1.2.0
 
-PowerShell tools to create RSA certificate templates and export/import their
-configuration. This release combines the existing creator with the new
-export/import tools and fixes the OID registration object names in both creation
-paths. Release date: 26 October 2026.
+PowerShell scripts to create AD CS certificate templates and export/import their
+configuration. RSA is the default. ECDSA and ECDH support P-256, P-384 and P-521.
+Release date: 27 October 2026. JSON FormatVersion remains 1.0.
 
-## Upgrade from earlier versions
-
-Use this release for new template creation and imports. Earlier releases used
-a random GUID for the OID registration object's CN. The expected deterministic
-name allows the Windows template management workflow to locate that registration
-when removing a template. With the correction, removal through certtmpl.msc was
-confirmed to remove both objects in the lab, for the creator and importer.
-
-**Existing OID registrations are not automatically repaired.** Replacing the
-scripts does not rename previously created objects. Do not change existing
-template OID values or delete OID registrations as a blanket cleanup: this
-release contains no migration or orphan-cleanup command. Review older objects
-separately. Keep the previous configuration exports and scripts for reference.
-
-The creator now has the stable filename `New-ADCertificateTemplate.ps1`.
-Update shortcuts/automation that call `New-ADCertificateTemplate-v1.0.ps1`.
-Creator parameter names are unchanged. Creator, exporter and importer report
-version 1.1.0. JSON FormatVersion remains 1.0; exports from the previous 0.1.0
-tools are still accepted.
-
-## Package contents
+## Files
 
 | File | Purpose |
 |---|---|
-| New-ADCertificateTemplate.ps1 | Create a new template from a schema 1/2 RSA source, with configurable settings |
-| Export-ADCertificateTemplate.ps1 | Export a custom schema 2/3/4 RSA template to typed JSON |
-| Import-ADCertificateTemplate.ps1 | Import JSON as a new template with a new OID and explicit permission mode |
-| ADCertificateTemplate.Portability.psm1 | Required shared module for export/import and their local tests |
-| Test-ADCertificateTemplate.ps1 | One-at-a-time creator scenario runner; dry run by default |
-| Test-ADTemplatePortability.ps1 | Local format, OID-name and DACL regression checks |
-| CREATOR.md | Creator parameters, examples and original scenario record |
-| EXPORT-IMPORT.md | Export/import examples, permission modes and constraints |
-| CHANGELOG.md | Release changes, validation and upgrade notice |
-| SHA256SUMS.txt | SHA256 checksums for the other files in this directory |
+| New-ADCertificateTemplate.ps1 | Create a new template with configurable settings |
+| Export-ADCertificateTemplate.ps1 | Export supported template configuration and a DACL snapshot to JSON |
+| Import-ADCertificateTemplate.ps1 | Import as a new template with a fresh OID |
+| ADCertificateTemplate.Portability.psm1 | Required shared module for export/import |
+| CREATOR.md | Generator parameters and examples |
+| EXPORT-IMPORT.md | Portability, permissions and dependencies |
+| ALGORITHMS.md | RSA/ECDSA/ECDH profiles and limits |
+| COMPLETION.md | Tab/Ctrl+Space choices and provider discovery |
+| CHANGELOG.md | Changes and upgrade notes |
+| SHA256SUMS.txt | SHA256 checksums for the other files |
 
-Extract the full archive and keep its files together. The creator is standalone;
-export/import require the supplied module beside them. These are custom scripts,
-not built-in Microsoft cmdlets.
+Extract the complete package and keep the files together. The generator is
+standalone; export/import require the supplied module beside them. These are
+custom scripts, not built-in Microsoft cmdlets. Development tests and test plans
+are not included in this distribution.
 
 ## Requirements
 
-Run Windows PowerShell 5.1 as Administrator. You still need the appropriate AD
-permissions, and CA permissions when publishing. Writable DC discovery is
-automatic; `-Server` on export/import is an optional DC override.
-Missing AD PowerShell tools can be installed automatically; installation depends
-on an available Windows component source. WhatIf does not install tools or write
-configuration. No CA role is installed and no automatic reboot is performed.
+Run in elevated Windows PowerShell 5.1 with appropriate AD permissions. A writable
+DC is discovered automatically. Missing AD PowerShell tools can be installed
+automatically if a Windows component source is available. WhatIf does not install
+tools or write configuration; directory reads still require available AD tools.
+No CA role is installed and no automatic reboot is performed.
 
-With `-Publish`, run on the local issuing enterprise CA. Publication uses
-certutil, including forced AD template discovery and issuance-list verification;
-ADCSAdministration is not required. Publication can also remain a separate task.
+Publication is optional. For `-Publish`, run on the local issuing enterprise CA
+with the required CA permissions. Publication uses certutil with forced template
+discovery and issuance-list verification; ADCSAdministration is not required.
+Publication may also be a separate action on the CA.
 
-## Create a template
+## Create
 
-Review the planned operation first, then create using a fresh unique name:
+Use an existing source and a fresh unique name. The generator applies its own
+parameter defaults; it is not an exact clone of every source setting.
 
 ```powershell
 $Settings = @{
-    Name = 'ExampleWeb01'
-    DisplayName = 'Example Web 01'
-    SourceTemplate = 'WebServer'
+    SourceTemplate    = 'WebServer'
+    Name              = 'ExampleWeb01'
+    DisplayName       = 'Example Web 01'
+    ProviderCategory  = 'Key Storage Provider'
     ProviderSelection = 'SelectedProviders'
-    Provider = 'Microsoft Software Key Storage Provider'
-    EnrollmentGroup = 'GG-PKI-WebServer-Enroll'
+    Provider          = 'Microsoft Software Key Storage Provider'
+    EnrollmentGroup   = 'GG-PKI-WebServer-Enroll'
 }
-
 .\New-ADCertificateTemplate.ps1 @Settings -WhatIf -Verbose
 .\New-ADCertificateTemplate.ps1 @Settings -Verbose
 ```
 
-Use a group that exists in your environment. See CREATOR.md for all settings.
+Use a group that exists in your environment. Source permissions and DACL
+inheritance protection are copied, with any explicitly requested enrollment
+groups added. Owner and audit ACL are not copied. See CREATOR.md for parameters.
+Use Tab/Ctrl+Space directly on parameters for available choices; ordinary
+hashtable values do not inherit parameter completion in PowerShell 5.1.
 
 ## Export and import
 
-Use an existing custom RSA template and a new destination name:
-
 ```powershell
 .\Export-ADCertificateTemplate.ps1 `
-    -TemplateName 'ExampleWeb01' `
-    -Path '.\ExampleWeb01.json' `
-    -Verbose
+    -TemplateName 'ExampleWeb01' -Path '.\ExampleWeb01.json'
 
 $Import = @{
-    Path = '.\ExampleWeb01.json'
-    Name = 'ExampleWebImported01'
-    DisplayName = 'Example Web Imported 01'
+    Path           = '.\ExampleWeb01.json'
+    Name           = 'ExampleWebImported01'
+    DisplayName    = 'Example Web Imported 01'
     PermissionMode = 'Preserve'
 }
-
 .\Import-ADCertificateTemplate.ps1 @Import -WhatIf -Verbose
 .\Import-ADCertificateTemplate.ps1 @Import -Verbose
 ```
 
-`Preserve` copies the exported DACL and inheritance state in the same forest.
-Owner and audit ACL are not transferred. EnrollmentGroups in the import result
-lists groups added by the command, not every group in the preserved DACL.
+Preserve copies the exported DACL and inheritance state in the same forest;
+owner and audit ACL are not transferred. TargetBaseline is the default permission
+mode and uses a destination baseline instead. Preserve is rejected across
+forests. Cross-forest TargetBaseline behavior still needs dedicated validation.
 
-`TargetBaseline` is the default permission mode: it uses a destination baseline
-(WebServer by default), optionally adding destination enrollment groups. It does
-not restore the exported custom-group permissions. Preserve is rejected across
-forests. TargetBaseline/cross-forest use still needs dedicated lab validation.
-
-Import always creates a new identity; it is not an in-place update or an
-identity-preserving disaster recovery restore. Inspect the JSON before import.
-The file contains configuration/account metadata but no certificates or private
-keys. Unknown populated PKI fields are rejected rather than silently dropped.
+Imports always create a new identity and OID. They do not overwrite a template
+or perform an identity-preserving disaster recovery restore. JSON contains
+configuration/account metadata, not certificates or private keys. Unsupported
+populated PKI fields are rejected instead of silently dropped.
 
 ## Publication and verification
 
-Creation/import does not publish unless `-Publish` is supplied. To publish an
-already created template separately, run on the CA, substituting its identity:
+Creation/import does not publish unless `-Publish` is supplied. To publish
+separately, run on the CA with the actual CA configuration and template name:
 
 ```powershell
 certutil -f -ADTemplate ExampleWebImported01
@@ -123,39 +99,58 @@ certutil -config 'CAHOST\CAName' -SetCATemplates '+ExampleWebImported01'
 certutil -config 'CAHOST\CAName' -CATemplates ExampleWebImported01
 ```
 
-A successful AD write is reported as Verified True after attribute/DACL
-read-back. With -Publish, also check Published and PublicationStatus. Failed
-publication retains the verified template and reports the error for a separate
-retry. Existing names are never overwritten.
+Verified True means the saved configuration and DACL passed read-back checks.
+It does not prove issuance or application interoperability. Inspect the template
+in certtmpl.msc and test actual enrollment. With -Publish, also inspect Published,
+PublicationStatus and PublicationError. Publication failure retains the verified
+template for a later retry. Existing template names are never overwritten.
 
-Verify the profile and permissions in certtmpl.msc, then test actual enrollment.
-For a cleanup test, record the template/OID object GUIDs, remove the test template
-from the CA issuance list, delete it through certtmpl.msc, and confirm both AD
-objects are absent. Deleting templates does not revoke issued certificates.
+## Validation record
 
-## Validation and scope
+Windows lab feedback received on 27 October 2026:
 
-The creator's ten original scenarios and two additional multi-SAN cases were
-reported successful in the Windows lab. The forced-discovery publication fix was
-also reported successful. For 1.1.0, the OID-name calculation matched a UI-created
-custom template, and MMC removed both objects for a newly created template.
+| Area | Observed result |
+|---|---|
+| Development configuration/OID/ACL suite | 155 passed, 0 failed |
+| Parameter completion suite | 30 passed, 0 failed; local KSP/CSP enumeration |
+| ECDH P-256, P-384, P-521 | Fresh rc7 creation, publication, enrollment and real private-key agreement passed |
+| ECDH P-256, P-384, P-521 imports | Same-forest Preserve export/import, issuance and real private-key agreement passed |
+| ECDSA P-256/P-384 | Creation, issuance, export/import and private-key signing passed |
+| ECDSA P-521 | Issuance and private-key signing passed |
+| Kerberos SAN options | Host/domain DNS SANs with empty or DNS CN subject, plus imported-template issuance, passed |
+| RSA regression | RSA3072 issuance passed |
+| OID registration cleanup | Deterministic name matched UI-created template; MMC deletion removed template and OID objects in earlier creator/importer tests |
 
-The new same-forest import test used a schema 4 RSA3072 Software KSP profile,
-SHA256 request hash, one-year validity and six-week renewal, plus a custom group
-with Read/Enroll. Export, WhatIf, Preserve import, UI settings/permissions, manual
-publication, enrollment and MMC/OID cleanup were all reported successful.
+The successful ECDH key tests confirmed matching secrets on both sides, the
+certificate's public key matching the private key, and different secrets for a
+different peer. These are cryptographic tests, not EFS file-encryption or complete
+application-protocol tests. The ECDH tests used Microsoft Software KSP on the lab
+systems. They do not establish compatibility with every provider, OS or source.
 
-The release build was syntax checked and its package/checksums verified. The
-Windows PowerShell regression script is provided but was not executed in the
-build environment. The live validation above used the implementation assembled
-in this release, before the final version/filename changes; the packaged artifact
-has not had a separate full live rerun.
+Final runtime logic is unchanged from tested rc7 apart from version strings.
+This final package has syntax and archive/checksum validation in the build
+environment; it has not had a separate complete Windows live rerun. The internal
+test-suite module selection was made explicit after the earlier multi-module
+session issue; that test-only adjustment has syntax validation and is not shipped.
 
-Not yet validated: cross-forest/TargetBaseline import, every supported RSA import
-profile, real renewal subject reuse, or original CSR hash inspection. ECC and
-schema 1 export/import are outside this release's scope.
+Not established by these tests: cross-forest imports, full trust/revocation or
+TLS/EFS application behavior, actual legacy OS interoperability, or ECDSA P-521
+live export/import. EC archival and schema 1 export/import are outside scope.
 
-These tools write directly to AD; they have not been migrated to the CertEnroll
-COM template API. The OID correction addresses the observed naming/cleanup bug.
-It does not establish Microsoft support for direct AD template automation, and
-lab success is not a vendor support statement.
+## Upgrade notes
+
+ECDH uses CNG AllUsages 16777215, matching the working UI-created control. The
+certificate Key Usage remains Key Agreement only. Earlier ECDH candidates using
+CNG value 4 could fail request creation with NTE_PERM. Such exports are rejected;
+correct the source and re-export, or create a new template. Replacing scripts
+does not repair existing templates or certificates and does not rewrite JSON.
+
+Deterministic OID registration names use the final OID arc followed by the MD5
+of the full OID encoded as UTF-16LE without a terminator. Older GUID-named OID
+registrations are not automatically renamed or removed. Never change template
+OIDs or delete OID registrations as blanket cleanup. Deleting a template does
+not revoke certificates already issued from it.
+
+These tools write directly to AD and have not been migrated to the CertEnroll
+COM template API. Lab success does not establish a Microsoft support statement
+for direct AD template automation.

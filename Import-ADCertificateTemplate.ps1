@@ -4,7 +4,7 @@
 .SYNOPSIS
 Imports an exported JSON configuration as a NEW AD certificate template.
 .DESCRIPTION
-Version 1.1.0. Requires the companion .psm1 in the same directory and Windows
+Version 1.2.0. Requires the companion .psm1 in the same directory and Windows
 PowerShell 5.1. Never overwrites templates; always creates a new OID registration.
 Raw configuration values (including binary durations and crypto settings) are
 retained. Identity, AD system fields, revision, minor revision and publication
@@ -173,14 +173,18 @@ try {
         }
     }
     if ($saved.DisplayName -cne $DisplayName) { throw 'Display name verification failed.' }
+    $crypto = Get-CTCryptography -Attributes $attributes
     $result = [PSCustomObject]@{
-        ImporterVersion = '1.1.0'
+        ImporterVersion = '1.2.0'
         Name = $saved.Name
         DisplayName = $saved.DisplayName
         DomainController = $context.DC
         SourceTemplate = Get-CTProperty $source 'Name'
         SourceTemplateOID = Get-CTProperty $source 'TemplateOID'
         TemplateOID = $identity.OID
+        Algorithm = $crypto.Algorithm
+        MinimumKeySize = [int]$attributes['msPKI-Minimal-Key-Size']
+        RequestHash = $crypto.RequestHash
         ConfigurationSHA256 = $inputHash
         PermissionMode = $PermissionMode
         PermissionTemplate = $(if ($PermissionMode -eq 'TargetBaseline') { $PermissionTemplate } else { $null })
