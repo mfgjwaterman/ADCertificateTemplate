@@ -1,4 +1,6 @@
-# Validation record — 1 November 2026
+# ADCertificateTemplate 2.0.0 validation record — 1 November 2026
+
+Candidate labels below record the implementation actually tested; they are historical evidence, not the current release version.
 
 Evidence below comes from the user's Windows lab reports in this collaboration. Local packaging checks are separate from live execution. This is not an independent production certification.
 
@@ -9,7 +11,7 @@ Evidence below comes from the user's Windows lab reports in this collaboration. 
 - Management environment: Windows Server 2025, Windows PowerShell 5.1 x64.
 - Enrollment client: LAB-WRK-01.
 
-## Integrated candidate results
+## Historical release-candidate results
 
 | Test | Implementation / run | Observed result |
 |---|---|---|
@@ -55,6 +57,6 @@ The final RC3 negative run subsequently exercised the integrated importer and pa
 
 - Integrated RC3 validation passed: one valid control, fourteen invalid configuration cases, two collisions and three unchanged-state snapshots. The autoenroll ACE/flag consistency guard rejected contradictory input as expected. DirectoryWritesRequested=False and CommitPermissionsTested=False.
 - Schema 4 is blocked because of the reproduced native crypto-reset defect. The product-group question remains open; no vendor fix or support commitment is claimed.
-- Other excluded serialization features are listed in README-COM.md.
-- RC3 validation executed in the user's Windows lab. The final 0.2.0 package changes labels and documentation, includes the negative harness, and retains the same shared runtime module; no additional final-label Windows run is claimed.
+- Other excluded serialization features are listed in README.md.
+- RC3 validation executed in the user's Windows lab. The public release is numbered 2.0.0; the earlier 0.2.0 package was a development-labelled artifact. This documentation revision does not change PowerShell source or rerun Windows tests. No additional final-label Windows run is claimed.
 - Local tree-sitter PowerShell syntax parsing of all seven PowerShell files, module byte comparison, code-change comparison, direct-AD-write scan, checksums and ZIP integrity passed. These are packaging checks, not Windows/AD runtime tests. The six core/regression files retain rc2 executable text except for version strings. The added negative harness matches the tested RC3 harness except for release-label guards and comment/version labels.
