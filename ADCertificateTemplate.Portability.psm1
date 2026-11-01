@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 # Shared helpers for Export/Import-ADCertificateTemplate, version 1.2.0.
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -542,5 +542,312 @@ function Test-CTDacl {
     return $false
 }
 
+
+
+
+function New-CTComDerValue {
+    param([byte]$Tag,[byte[]]$Content)
+    $Header = [Collections.Generic.List[byte]]::new()
+    $Header.Add($Tag)
+    if ($Content.Length -lt 128) { $Header.Add([byte]$Content.Length) }
+    elseif ($Content.Length -le 255) { $Header.Add(0x81); $Header.Add([byte]$Content.Length) }
+    elseif ($Content.Length -le 65535) {
+        $Header.Add(0x82); $Header.Add([byte]($Content.Length -shr 8)); $Header.Add([byte]($Content.Length -band 255))
+    }
+    else { throw 'DER value too large for this probe.' }
+    $Header.AddRange($Content)
+    return ,$Header.ToArray()
+}
+function New-CTComDerOid {
+    param([string]$Oid)
+    if ($Oid -notmatch '^[0-2](\.[0-9]+){2,}$') { throw "Invalid policy OID: $Oid" }
+    $Arcs = @($Oid.Split('.') | ForEach-Object { [uint64]::Parse($_) })
+    if ($Arcs[0] -lt 2 -and $Arcs[1] -gt 39) { throw "Invalid policy OID: $Oid" }
+    $Bytes = [Collections.Generic.List[byte]]::new()
+    $Numbers = @([uint64](40*$Arcs[0]+$Arcs[1])) + @($Arcs[2..($Arcs.Count-1)])
+    foreach ($Number in $Numbers) {
+        $Value = [uint64]$Number
+        $Encoded = [Collections.Generic.List[byte]]::new()
+        $Encoded.Insert(0,[byte]($Value -band 127)); $Value = $Value -shr 7
+        while ($Value -gt 0) {
+            $Encoded.Insert(0,[byte](($Value -band 127) -bor 128)); $Value = $Value -shr 7
+        }
+        $Bytes.AddRange($Encoded.ToArray())
+    }
+    return ,(New-CTComDerValue 6 $Bytes.ToArray())
+}
+function New-CTComPolicyDer {
+    param([string[]]$Oids,[switch]$ApplicationPolicies)
+    $Bytes = [Collections.Generic.List[byte]]::new()
+    foreach ($Oid in $Oids) {
+        [byte[]]$Encoded = New-CTComDerOid $Oid
+        if ($ApplicationPolicies) { $Encoded = New-CTComDerValue 48 $Encoded }
+        $Bytes.AddRange($Encoded)
+    }
+    return [Convert]::ToBase64String((New-CTComDerValue 48 $Bytes.ToArray()))
+}
+
+
+$script:CTComFixture=@'
+<GetPoliciesResponse xmlns="http://schemas.microsoft.com/windows/pki/2009/01/enrollmentpolicy" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"><response><policyID>COM-Memory-Probe</policyID><policyFriendlyName>COM Memory Probe</policyFriendlyName><nextUpdateHours>8</nextUpdateHours><policiesNotChanged xsi:nil="true" /><policies><policy><policyOIDReference>1</policyOIDReference><cAs xsi:nil="true" /><attributes><commonName>COMSchemaFixture</commonName><policySchema>4</policySchema><certificateValidity><validityPeriodSeconds>31536000</validityPeriodSeconds><renewalPeriodSeconds>3628800</renewalPeriodSeconds></certificateValidity><permission><enroll>false</enroll><autoEnroll>false</autoEnroll></permission><privateKeyAttributes><minimalKeyLength>3072</minimalKeyLength><keySpec>1</keySpec><keyUsageProperty>3</keyUsageProperty><permissions xsi:nil="true" /><algorithmOIDReference>5</algorithmOIDReference><cryptoProviders><provider>Microsoft Software Key Storage Provider</provider></cryptoProviders></privateKeyAttributes><revision><majorRevision>1</majorRevision><minorRevision>0</minorRevision></revision><supersededPolicies xsi:nil="true" /><privateKeyFlags>100990976</privateKeyFlags><subjectNameFlags>1</subjectNameFlags><enrollmentFlags>0</enrollmentFlags><generalFlags>513</generalFlags><hashAlgorithmOIDReference>6</hashAlgorithmOIDReference><rARequirements xsi:nil="true" /><keyArchivalAttributes xsi:nil="true" /><extensions><extension><oIDReference>2</oIDReference><critical>true</critical><value>AwIFoA==</value></extension><extension><oIDReference>3</oIDReference><critical>false</critical><value>MAoGCCsGAQUFBwMB</value></extension><extension><oIDReference>4</oIDReference><critical>false</critical><value>MAwwCgYIKwYBBQUHAwE=</value></extension></extensions></attributes></policy></policies></response><cAs xsi:nil="true" /><oIDs><oID><value>2.25.1</value><group>9</group><oIDReferenceID>1</oIDReferenceID><defaultName>COM Schema Fixture</defaultName></oID><oID><value>2.5.29.15</value><group>6</group><oIDReferenceID>2</oIDReferenceID><defaultName>Key Usage</defaultName></oID><oID><value>2.5.29.37</value><group>6</group><oIDReferenceID>3</oIDReferenceID><defaultName>Enhanced Key Usage</defaultName></oID><oID><value>1.3.6.1.4.1.311.21.10</value><group>6</group><oIDReferenceID>4</oIDReferenceID><defaultName>Application Policies</defaultName></oID><oID><value>1.2.840.113549.1.1.1</value><group>3</group><oIDReferenceID>5</oIDReferenceID><defaultName>RSA</defaultName></oID><oID><value>2.16.840.1.101.3.4.2.1</value><group>1</group><oIDReferenceID>6</oIDReferenceID><defaultName>SHA256</defaultName></oID></oIDs></GetPoliciesResponse>
+'@
+# COM candidate backend. Preparation never writes AD; Commit(1/4) is the only mutation path.
+function ConvertTo-CTComUnsigned {
+    param([int]$Value)
+    [BitConverter]::ToUInt32([BitConverter]::GetBytes($Value),0).ToString([Globalization.CultureInfo]::InvariantCulture)
+}
+function Test-CTComValue {
+    param([string]$Name,$Expected,$Actual)
+    if ($Name -eq 'msPKI-RA-Application-Policies') {
+        $left=@(Get-CTStrings $Expected);$right=@(Get-CTStrings $Actual)
+        if ($left.Count -eq 0 -and $right.Count -eq 0) {return $true}
+        if ($left.Count -ne 1 -or $right.Count -ne 1) {return $false}
+        $a=Get-CTKspProperties $left[0];$b=Get-CTKspProperties $right[0]
+        if ($a.Count -ne $b.Count) {return $false}
+        foreach ($key in $a.Keys) {
+            if (-not $b.ContainsKey($key) -or $a[$key].Type -cne $b[$key].Type -or $a[$key].Value -cne $b[$key].Value) {return $false}
+        }
+        return $true
+    }
+    if ($Name -eq 'pKIKeyUsage') {
+        [byte[]]$a=$Expected;[byte[]]$b=ConvertTo-CTBinary $Actual
+        while ($a.Count -gt 1 -and $a[-1] -eq 0) {$a=@($a[0..($a.Count-2)])}
+        while ($b.Count -gt 1 -and $b[-1] -eq 0) {$b=@($b[0..($b.Count-2)])}
+        return (($a -join ',') -ceq ($b -join ','))
+    }
+    if ($Name -in @('msPKI-RA-Signature','pKIMaxIssuingDepth','msPKI-Enrollment-Flag')) {
+        if ($null -eq $Actual) {$Actual=0}
+    }
+    return (Test-CTAttribute -Expected $Expected -Actual $Actual)
+}
+function New-CTComPlan {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][hashtable]$Attributes,
+        [Parameter(Mandatory)][string]$Name,[Parameter(Mandatory)][string]$DisplayName,
+        [Parameter(Mandatory)]$Security,[Parameter(Mandatory)]$Context)
+    if (-not [Environment]::Is64BitProcess) {throw 'COM candidate requires 64-bit Windows PowerShell.'}
+    if ($Name -notmatch '^[A-Za-z][A-Za-z0-9_-]{0,63}$') {throw 'Invalid destination name.'}
+    if ([string]::IsNullOrWhiteSpace($DisplayName)) {throw 'Empty display name.'}
+    Assert-CTConfiguration $Attributes
+    if ([int]$Attributes['msPKI-Template-Schema-Version'] -eq 4) {
+        throw 'Schema 4 is blocked in the COM candidate due to the reproduced crypto-reset defect. No silent schema downgrade is performed. For creation explicitly select pre-2012 compatibility.'
+    }
+    $expected=@{}
+    foreach ($key in $Attributes.Keys) {$expected[$key]=$Attributes[$key]}
+    foreach ($identity in @('msPKI-Cert-Template-OID','revision','msPKI-Template-Minor-Revision')) {$expected.Remove($identity)}
+    $allowed=@('flags','pKIDefaultKeySpec','pKIKeyUsage','pKIMaxIssuingDepth','pKICriticalExtensions','pKIExtendedKeyUsage','pKIExpirationPeriod','pKIOverlapPeriod','pKIDefaultCSPs','msPKI-Certificate-Name-Flag','msPKI-Enrollment-Flag','msPKI-Private-Key-Flag','msPKI-RA-Signature','msPKI-RA-Application-Policies','msPKI-Certificate-Application-Policy','msPKI-Template-Schema-Version','msPKI-Minimal-Key-Size','msPKI-Supersede-Templates')
+    foreach ($key in @($expected.Keys)) {
+        if ($key -notin $allowed) {
+            if (@(Get-CTStrings $expected[$key]).Count -gt 0) {throw "COM candidate does not serialize populated attribute: $key"}
+            $expected.Remove($key)
+        }
+    }
+    if ([int]$expected['msPKI-RA-Signature'] -ne 0 -or [int]$expected['pKIMaxIssuingDepth'] -ne 0) {throw 'RA signatures or nonzero max issuing depth are outside this COM candidate.'}
+    if (([int]$expected['msPKI-Private-Key-Flag'] -band 1) -ne 0) {throw 'Private-key archival is outside this COM candidate.'}
+    $critical=@(Get-CTStrings $expected['pKICriticalExtensions'])
+    if ($critical.Count -ne 1 -or $critical[0] -cne '2.5.29.15') {throw 'This candidate supports only critical Key Usage.'}
+    $ekus=@(Get-CTStrings $expected['pKIExtendedKeyUsage'])
+    $apps=@(Get-CTStrings $expected['msPKI-Certificate-Application-Policy'])
+    if ($apps.Count -eq 0 -or ((($ekus | Sort-Object) -join ',') -cne (($apps | Sort-Object) -join ','))) {
+        throw 'COM candidate requires explicit, matching nonempty EKU and Application Policies. Import never adds missing policies silently.'
+    }
+    Assert-CTPolicyDependencies -Context $Context -Attributes $expected
+    $crypto=Get-CTCryptography $expected
+    if ($crypto.IsLegacy -and [int]$expected['msPKI-Template-Schema-Version'] -ne 2) {throw 'Legacy CSP requires schema 2 in this candidate.'}
+    if (-not $crypto.IsLegacy -and [int]$expected['msPKI-Template-Schema-Version'] -ne 3) {throw 'KSP requires schema 3 in this candidate.'}
+    $algorithmOid='1.2.840.113549.1.1.1'
+    if (-not $crypto.IsLegacy) {
+        if ($crypto.Algorithm -match '^ECD(SA|H)_P(256|384|521)$') {
+            $algorithmOid=@{'256'='1.2.840.10045.3.1.7';'384'='1.3.132.0.34';'521'='1.3.132.0.35'}[$Matches[2]]
+        }
+        $hashOids=@{SHA1='1.3.14.3.2.26';SHA256='2.16.840.1.101.3.4.2.1';SHA384='2.16.840.1.101.3.4.2.2';SHA512='2.16.840.1.101.3.4.2.3'}
+        if (-not $hashOids.ContainsKey($crypto.RequestHash)) {throw 'An explicit SHA1/SHA2 request hash is required.'}
+        $p=$crypto.Properties
+        foreach ($key in $p.Keys) {
+            if ($key -notin @('msPKI-Asymmetric-Algorithm','msPKI-Hash-Algorithm','msPKI-Key-Usage','msPKI-Symmetric-Algorithm','msPKI-Symmetric-Key-Length')) {throw "Unsupported embedded crypto property: $key"}
+        }
+        if (-not $p.ContainsKey('msPKI-Key-Usage') -or $p['msPKI-Key-Usage'].Type -cne 'DWORD' -or $crypto.CngKeyUsage -notmatch '^\d+$') {throw 'Explicit DWORD CNG usage is required.'}
+        if ($p['msPKI-Hash-Algorithm'].Type -cne 'PZPWSTR') {throw 'Request hash type mismatch.'}
+        if (($p.ContainsKey('msPKI-Symmetric-Algorithm') -and $p['msPKI-Symmetric-Algorithm'].Value -cne '3DES') -or
+            ($p.ContainsKey('msPKI-Symmetric-Key-Length') -and $p['msPKI-Symmetric-Key-Length'].Value -cne '168')) {throw 'Nondefault symmetric crypto properties are outside the candidate.'}
+        # Native COM adds these defaults; normalize the EXPECTATION explicitly for creator input.
+        $expected['msPKI-RA-Application-Policies']=[string[]]@('msPKI-Asymmetric-Algorithm`PZPWSTR`'+$crypto.Algorithm+'`msPKI-Hash-Algorithm`PZPWSTR`'+$crypto.RequestHash+'`msPKI-Key-Usage`DWORD`'+$crypto.CngKeyUsage+'`msPKI-Symmetric-Algorithm`PZPWSTR`3DES`msPKI-Symmetric-Key-Length`DWORD`168`')
+    }
+    elseif (@(Get-CTStrings $expected['msPKI-RA-Application-Policies']).Count) {throw 'Legacy embedded RA/crypto policies are outside the candidate.'}
+    # Observed native custom-template flags; all other general flag bits remain exact.
+    $expected['flags']=([int]$expected['flags'] -band (-bnot 0x10000)) -bor 0x20000
+    $providers=@(Get-CTStrings $expected['pKIDefaultCSPs'])
+    $providerNames=@()
+    $ranked=@()
+    foreach ($provider in $providers) {
+        if ($provider -notmatch '^(\d+),(.+)$') {throw 'Invalid provider priority/name.'}
+        $ranked += [pscustomobject]@{Rank=[int]$Matches[1];Name=$Matches[2]}
+    }
+    $ranked=@($ranked | Sort-Object Rank)
+    for ($i=0;$i -lt $ranked.Count;$i++) {
+        if ($ranked[$i].Rank -ne $i+1) {throw 'Provider priorities must be contiguous starting at 1.'}
+        $providerNames += $ranked[$i].Name
+    }
+    if (@($providerNames | Select-Object -Unique).Count -ne $providerNames.Count) {throw 'Duplicate provider names.'}
+    $validity=-[BitConverter]::ToInt64([byte[]]$expected['pKIExpirationPeriod'],0)/[TimeSpan]::TicksPerSecond
+    $renewal=-[BitConverter]::ToInt64([byte[]]$expected['pKIOverlapPeriod'],0)/[TimeSpan]::TicksPerSecond
+    if ($validity -ne [Math]::Floor($validity) -or $renewal -ne [Math]::Floor($renewal)) {throw 'COM candidate requires intervals in whole seconds.'}
+    [byte[]]$ku=$expected['pKIKeyUsage']
+    if ($ku.Length -notin 1,2) {throw 'Unsupported certificate key usage length.'}
+    [byte]$last=$ku[-1]
+    $unused=0
+    if ($last -eq 0 -and $ku.Length -eq 2) {$ku=[byte[]]@($ku[0]);$last=$ku[0]}
+    if ($last -eq 0) {throw 'Empty key usage.'}
+    while (($last -band 1) -eq 0) {$unused++;$last=$last -shr 1}
+    [byte[]]$kuDer=New-CTComDerValue 3 ([byte[]](@([byte]$unused)+@($ku)))
+    $super=@(Get-CTStrings $expected['msPKI-Supersede-Templates'])
+    foreach ($dependency in $super) {
+        if ($dependency -ieq $Name) {throw 'Cannot supersede self.'}
+        $null=Get-CTTemplate -Context $Context -Name $dependency
+    }
+    if (@($Security.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier])).Count -eq 0) {throw 'Empty DACL refused.'}
+    $autoRules=@($Security.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier]) | Where-Object {
+        $_.AccessControlType -eq 'Allow' -and $_.ObjectType -eq [guid]'a05b8cc2-17bc-4802-a710-e7c15ab866a2' -and
+        (([int]$_.ActiveDirectoryRights -band [int][DirectoryServices.ActiveDirectoryRights]::ExtendedRight) -ne 0)
+    })
+    if ($autoRules.Count -gt 0 -and (([int]$expected['msPKI-Enrollment-Flag'] -band 0x20) -eq 0)) {
+        throw 'Autoenroll ACE present but template autoenrollment flag 0x20 is absent. COM may add that bit. Import refuses to silently change exported enrollment flags; review the intended configuration.'
+    }
+    if (Get-CTTemplate -Context $Context -Name $Name -Optional) {throw "Destination exists: $Name"}
+    if (@(Get-ADObject -Server $Context.DC -SearchBase $Context.TemplateContainer -SearchScope OneLevel -Filter {displayName -eq $DisplayName}).Count) {throw 'Destination display name exists.'}
+    [xml]$xml=$script:CTComFixture
+    $ns=[Xml.XmlNamespaceManager]::new($xml.NameTable)
+    $uri='http://schemas.microsoft.com/windows/pki/2009/01/enrollmentpolicy'
+    $ns.AddNamespace('p',$uri)
+    $changes=@{
+        '//p:attributes/p:commonName'=$Name
+        '//p:oID[p:oIDReferenceID="1"]/p:defaultName'=$DisplayName
+        '//p:attributes/p:policySchema'=[string]$expected['msPKI-Template-Schema-Version']
+        '//p:certificateValidity/p:validityPeriodSeconds'=[string]$validity
+        '//p:certificateValidity/p:renewalPeriodSeconds'=[string]$renewal
+        '//p:privateKeyAttributes/p:minimalKeyLength'=[string]$expected['msPKI-Minimal-Key-Size']
+        '//p:privateKeyAttributes/p:keySpec'=[string]$expected['pKIDefaultKeySpec']
+        '//p:attributes/p:privateKeyFlags'=(ConvertTo-CTComUnsigned ([int]$expected['msPKI-Private-Key-Flag']))
+        '//p:attributes/p:subjectNameFlags'=(ConvertTo-CTComUnsigned ([int]$expected['msPKI-Certificate-Name-Flag']))
+        '//p:attributes/p:enrollmentFlags'=(ConvertTo-CTComUnsigned ([int]$expected['msPKI-Enrollment-Flag']))
+        '//p:attributes/p:generalFlags'=(ConvertTo-CTComUnsigned ([int]$expected['flags']))
+        '//p:extension[p:oIDReference="2"]/p:value'=[Convert]::ToBase64String($kuDer)
+        '//p:extension[p:oIDReference="3"]/p:value'=(New-CTComPolicyDer $ekus)
+        '//p:extension[p:oIDReference="4"]/p:value'=(New-CTComPolicyDer $apps -ApplicationPolicies)
+    }
+    foreach ($xpath in $changes.Keys) {$xml.SelectSingleNode($xpath,$ns).InnerText=$changes[$xpath]}
+    $prov=$xml.SelectSingleNode('//p:privateKeyAttributes/p:cryptoProviders',$ns);$prov.RemoveAll()
+    foreach ($providerName in $providerNames) {$node=$xml.CreateElement('provider',$uri);$node.InnerText=$providerName;$null=$prov.AppendChild($node)}
+    if (-not $providerNames.Count) {$null=$prov.SetAttribute('nil','http://www.w3.org/2001/XMLSchema-instance','true')}
+    $sup=$xml.SelectSingleNode('//p:attributes/p:supersededPolicies',$ns);$sup.RemoveAll()
+    foreach ($dependency in $super) {$node=$xml.CreateElement('commonName',$uri);$node.InnerText=$dependency;$null=$sup.AppendChild($node)}
+    if (-not $super.Count) {$null=$sup.SetAttribute('nil','http://www.w3.org/2001/XMLSchema-instance','true')}
+    if ($crypto.IsLegacy) {
+        foreach ($xpath in @('//p:privateKeyAttributes/p:keyUsageProperty','//p:privateKeyAttributes/p:algorithmOIDReference','//p:attributes/p:hashAlgorithmOIDReference')) {
+            $node=$xml.SelectSingleNode($xpath,$ns);$node.RemoveAll();$null=$node.SetAttribute('nil','http://www.w3.org/2001/XMLSchema-instance','true')
+        }
+    }
+    else {
+        $xml.SelectSingleNode('//p:privateKeyAttributes/p:keyUsageProperty',$ns).InnerText=$crypto.CngKeyUsage
+        $xml.SelectSingleNode('//p:oID[p:oIDReferenceID="5"]/p:value',$ns).InnerText=$algorithmOid
+        $xml.SelectSingleNode('//p:oID[p:oIDReferenceID="5"]/p:defaultName',$ns).InnerText=$crypto.Algorithm
+        $xml.SelectSingleNode('//p:oID[p:oIDReferenceID="6"]/p:value',$ns).InnerText=$hashOids[$crypto.RequestHash]
+        $xml.SelectSingleNode('//p:oID[p:oIDReferenceID="6"]/p:defaultName',$ns).InnerText=$crypto.RequestHash
+    }
+    $plan=[pscustomobject]@{Name=$Name;DisplayName=$DisplayName;Context=$Context;Expected=$expected;Xml=$xml.OuterXml;Security=$Security;Crypto=$crypto}
+    # Validate the prepared in-memory COM input before user approval or directory writes.
+    $objects=Open-CTComPlan $plan
+    try {
+        $t=$objects.Template
+        if ([string]$t.Property(1) -cne $Name -or [int]$t.Property(8) -ne [int]$expected['msPKI-Template-Schema-Version'] -or
+            [int]$t.Property(11) -ne [int]$expected['msPKI-Minimal-Key-Size']) {throw 'Prepared COM input mismatch.'}
+        if (-not $crypto.IsLegacy -and ([string]$t.Property(18) -cne $crypto.Algorithm -or [string]$t.Property(22) -cne $crypto.RequestHash)) {throw 'Prepared COM crypto mismatch.'}
+    }
+    finally {Close-CTComPlan $objects}
+    return $plan
+}
+function Open-CTComPlan {
+    param($Plan)
+    $p=$null;$ts=$null;$t=$null;$w=$null
+    try {
+        $p=New-Object -ComObject X509Enrollment.CX509EnrollmentPolicyWebService
+        $p.InitializeImport([Text.Encoding]::UTF8.GetBytes($Plan.Xml))
+        $ts=$p.GetTemplates();$t=$ts.ItemByName($Plan.Name)
+        $w=New-Object -ComObject X509Enrollment.CX509CertificateTemplateADWritable
+        $w.Initialize($t)
+        $sddl=$Plan.Security.GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::Access)
+        $null=$w.GetType().InvokeMember('Property',[Reflection.BindingFlags]::SetProperty,$null,$w,[object[]]@([int]28,$sddl))
+        return [pscustomobject]@{Policy=$p;Templates=$ts;Template=$t;Writer=$w}
+    }
+    catch {Close-CTComPlan ([pscustomobject]@{Writer=$w;Template=$t;Templates=$ts;Policy=$p});throw}
+}
+function Close-CTComPlan {
+    param($Objects)
+    foreach ($object in @($Objects.Writer,$Objects.Template,$Objects.Templates,$Objects.Policy)) {
+        if ($null -ne $object -and [Runtime.InteropServices.Marshal]::IsComObject($object)) {[void][Runtime.InteropServices.Marshal]::ReleaseComObject($object)}
+    }
+}
+function Remove-CTComOwned {
+    param($Plan,$Owned)
+    $c=$Plan.Context
+    $current=Get-CTTemplate -Context $c -Name $Plan.Name
+    if ($current.ObjectGUID -ne $Owned.TemplateGuid -or [string]$current.'msPKI-Cert-Template-OID' -cne $Owned.OID) {throw 'Cleanup identity changed; deletion withheld.'}
+    $oid=Get-ADObject -Server $c.DC -Identity $Owned.OidGuid -Properties msPKI-Cert-Template-OID
+    if ([string]$oid.'msPKI-Cert-Template-OID' -cne $Owned.OID) {throw 'Cleanup OID identity changed.'}
+    $cas=@(Get-ADObject -Server $c.DC -SearchBase "CN=Enrollment Services,CN=Public Key Services,CN=Services,$($c.ConfigurationDN)" -LDAPFilter '(objectClass=pKIEnrollmentService)' -Properties certificateTemplates | Where-Object {$_.certificateTemplates -contains $Plan.Name})
+    if ($cas.Count) {throw 'Cleanup withheld: template is published.'}
+    [xml]$xml=$Plan.Xml;$ns=[Xml.XmlNamespaceManager]::new($xml.NameTable);$ns.AddNamespace('p','http://schemas.microsoft.com/windows/pki/2009/01/enrollmentpolicy')
+    $xml.SelectSingleNode('//p:oID[p:oIDReferenceID="1"]/p:value',$ns).InnerText=$Owned.OID
+    $deletePlan=[pscustomobject]@{Xml=$xml.OuterXml;Name=$Plan.Name;Security=$Plan.Security}
+    $o=Open-CTComPlan $deletePlan
+    try {
+        if ([string]$o.Template.Property(1) -cne $Plan.Name -or [string]($o.Template.Property(12).Value) -cne $Owned.OID) {throw 'Cleanup COM identity mismatch.'}
+        $o.Writer.Commit(4,$c.DC)
+    }
+    finally {Close-CTComPlan $o}
+    if (Get-CTTemplate -Context $c -Name $Plan.Name -Optional) {throw 'Cleanup left a template.'}
+    if (@(Get-ADObject -Server $c.DC -SearchBase $c.OIDContainer -SearchScope OneLevel -LDAPFilter "(msPKI-Cert-Template-OID=$($Owned.OID))").Count) {throw 'Cleanup left an OID object.'}
+}
+function Invoke-CTComPlan {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Plan,[switch]$InjectVerificationFailure)
+    $c=$Plan.Context
+    if (Get-CTTemplate -Context $c -Name $Plan.Name -Optional) {throw 'Destination appeared after preparation; refusing Commit.'}
+    $beforeOids=@(Get-ADObject -Server $c.DC -SearchBase $c.OIDContainer -SearchScope OneLevel -Filter *)
+    $owned=$null;$committed=$false
+    $o=Open-CTComPlan $Plan
+    try {
+        $o.Writer.Commit(1,$c.DC);$committed=$true
+        $saved=Get-CTTemplate -Context $c -Name $Plan.Name
+        $newOid=[string]$saved.'msPKI-Cert-Template-OID'
+        $oids=@(Get-ADObject -Server $c.DC -SearchBase $c.OIDContainer -SearchScope OneLevel -LDAPFilter "(msPKI-Cert-Template-OID=$newOid)")
+        if ($oids.Count -ne 1 -or $oids[0].ObjectGUID -in @($beforeOids.ObjectGUID)) {throw 'Cannot establish ownership of generated OID.'}
+        $owned=[pscustomobject]@{TemplateGuid=$saved.ObjectGUID;OID=$newOid;OidGuid=$oids[0].ObjectGUID}
+        if ($InjectVerificationFailure) {throw 'LAB_INJECTED_POSTCOMMIT_VERIFICATION_FAILURE'}
+        $security=Get-CTSecurity -Context $c -DistinguishedName $saved.DistinguishedName
+        if (-not (Test-CTDacl -Expected $Plan.Security -Actual $security)) {throw 'COM DACL read-back mismatch.'}
+        foreach ($key in $Plan.Expected.Keys) {
+            $actualValue=Get-CTProperty $saved $key
+            if (-not (Test-CTComValue -Name $key -Expected $Plan.Expected[$key] -Actual $actualValue)) {
+                $expectedText=(@(Get-CTStrings $Plan.Expected[$key]) -join '|')
+                $actualText=(@(Get-CTStrings $actualValue) -join '|')
+                throw "COM read-back mismatch on $($Plan.Name): $key; Expected=[$expectedText]; Actual=[$actualText]"
+            }
+        }
+        if ($saved.DisplayName -cne $Plan.DisplayName -or [int]$saved.revision -ne 1 -or [int]$saved.'msPKI-Template-Minor-Revision' -ne 0) {throw 'Display name/revision mismatch.'}
+        return [pscustomobject]@{Saved=$saved;Security=$security;OID=$newOid;Owned=$owned}
+    }
+    catch {
+        $failure=$_
+        if ($null -ne $owned) {
+            try {Remove-CTComOwned -Plan $Plan -Owned $owned;Write-Warning 'COM verification failed; owned template and OID were removed.'}
+            catch {Write-Warning "COM cleanup failed: $($_.Exception.Message). Inspect $($Plan.Name), OID $($owned.OID)."}
+        }
+        elseif ($committed) {Write-Warning "Commit succeeded but ownership/read-back failed. No blind cleanup performed. Inspect $($Plan.Name)."}
+        else {Write-Warning "Commit failed. A partial native write cannot be excluded; inspect $($Plan.Name) before retrying."}
+        throw $failure
+    }
+    finally {Close-CTComPlan $o}
+}
 
 Export-ModuleMember -Function *-CT*

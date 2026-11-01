@@ -1,10 +1,11 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 #Requires -RunAsAdministrator
 <#
 .SYNOPSIS
 Creates an RSA, ECDSA or ECDH certificate template from a version 1/2 RSA source.
 .DESCRIPTION
-Version 1.2.0. Creates a new OID registration and template, copies the source
+COM candidate 0.2.0, derived from version 1.2.0. Native CertEnroll creates
+a fresh OID registration and template. Copies the source
 DACL and its inheritance setting, and applies the selected settings. Never overwrites an existing template. With -Publish, publishes on the LOCAL
 enterprise CA after successful creation and verification.
 
@@ -27,11 +28,15 @@ application interoperability must be validated separately.
 Provider names are not checked against the local machine: the enrollment
 client, not this management machine, must have the provider installed.
 
+Schema 4 creation is blocked in this COM candidate. Explicitly select pre-2012
+CA/recipient compatibility for schema 3 KSP or schema 2 legacy creation. The
+retained defaults below request schema 4 and therefore fail before AD writes.
 Defaults: CA 2012 R2, recipient Windows 10/Server 2016, KSP, RSA 3072,
 SHA256, any provider, one year (365 days), subject supplied in request,
 approval off, key export off. Source renewal period and policies are retained
 unless overridden. Source private-key/enrollment flags otherwise remain intact.
 No new enrollment ACEs are added unless EnrollmentGroup is supplied.
+EnrollAndAutoenroll with enrollment groups also sets enrollment flag 0x20.
 
 ApplicationPolicy adds OIDs to both source policy lists; it does not replace
 them. The source's owner and audit ACL are not copied. Inherited permissions
@@ -56,14 +61,10 @@ strict comparison. Unexpected differences log both SDDL values before rollback.
 Publication uses certutil with forced AD template discovery, exit-code and
 issuance-list checks. Patch 1.0.1 added certutil -f -ADTemplate before
 publication and requires the expected template name in its output.
-Version 1.1.0 derives the OID object CN from the final OID arc and the MD5
-hash of its UTF-16LE bytes, without a terminator. Existing OID objects are
-not repaired automatically. Export/import tools are included separately.
-Release 1.0.0 preserved the implementation validated in 0.2.2. The ten lab
-scenarios and two additional multi-SAN cases were reported successful.
-Actual subject reuse on renewal and the hash in the original CSR were not
-independently verified. The template name eventually resolved on the client;
-this release does not force an OID cache refresh.
+Native CertEnroll assigns the fresh OID. This candidate does not use the
+original direct-AD OID naming algorithm. A failure before native object ownership
+can be captured requires inspection; automatic recovery of partial Commit is
+not guaranteed. See README-COM.md and VALIDATION.md for scope and test evidence.
 
 .PARAMETER Name
 Unique internal template name (letters, digits, underscore, hyphen).
@@ -155,9 +156,11 @@ $settings = @{
 .EXAMPLE
 .\New-ADCertificateTemplate.ps1 -Name MWMultiSANUser01 -DisplayName 'MW Multi SAN User 01' -SourceTemplate User -SubjectNameMode ActiveDirectory -SubjectNameFormat 'Common name' -SubjectAlternativeName UPN,'E-mail name' -EnrollmentGroup 'GG-T0-Admins' -Publish
 .NOTES
-Version: 1.2.0
+Version: 0.2.0-COM
 Use Get-Help -Full for parameters and examples. Without -Publish: creation only.
-Direct AD changes: validate resulting UI settings and enroll in a lab before production.
+COM candidate: validate UI/enrollment in a lab. Schema4 is blocked; explicitly choose pre-2012 compatibility. No silent downgrade.
+Original defaults are retained, so the default modern compatibility is rejected.
+Unsupported RA/archival and certificate-policy settings are rejected before writes.
 #>
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
 param(
@@ -281,6 +284,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+Import-Module (Join-Path $PSScriptRoot 'ADCertificateTemplate.Portability.psm1') -Force -ErrorAction Stop -Verbose:$false
 
 function Get-AttributeValue {
     param($Object, [string]$Attribute)
@@ -627,6 +631,10 @@ $attributes['msPKI-Certificate-Name-Flag'] = [int]$nameFlags
 $enrollmentFlags = [int]$attributes['msPKI-Enrollment-Flag']
 if ($RequireManagerApproval) { $enrollmentFlags = $enrollmentFlags -bor 2 }
 else { $enrollmentFlags = $enrollmentFlags -band (-bnot 2) }
+# Autoenroll request is explicit: keep its template flag consistent with added ACEs.
+if (@($EnrollmentGroup).Count -gt 0 -and $EnrollmentPermission -eq 'EnrollAndAutoenroll') {
+    $enrollmentFlags = $enrollmentFlags -bor 0x20
+}
 $attributes['msPKI-Enrollment-Flag'] = [int]$enrollmentFlags
 
 $policyNames = @{'Client Authentication'='1.3.6.1.5.5.7.3.2';
@@ -687,40 +695,9 @@ try {
 }
 finally { $sourceEntry.PSBase.Dispose() }
 
-function Get-CTOIDObjectName {
-    param(
-        [Parameter(Mandatory)]
-        [ValidatePattern('^[0-2](\.[0-9]+)+$')]
-        [string]$OID
-    )
-    # Verified against a custom template created through certtmpl.msc.
-    # UTF-16LE without a BOM or terminating NUL; MD5 is for object naming only.
-    $md5 = [System.Security.Cryptography.MD5]::Create()
-    try {
-        $oidBytes = [System.Text.Encoding]::Unicode.GetBytes($OID)
-        $hashBytes = $md5.ComputeHash($oidBytes)
-        $hashHex = ($hashBytes | ForEach-Object {
-            $_.ToString('X2')
-        }) -join ''
-        return ('{0}.{1}' -f $OID.Split('.')[-1], $hashHex)
-    }
-    finally {
-        $md5.Dispose()
-    }
-}
-
-do {
-    $part1 = Get-Random -Minimum 10000000 -Maximum 99999999
-    $part2 = Get-Random -Minimum 10000000 -Maximum 99999999
-    $newOid = "$forestOid.$part1.$part2"
-    $existingOid = Get-ADObject -Server $DC -SearchBase $oidContainer -LDAPFilter "(msPKI-Cert-Template-OID=$newOid)"
-} while ($existingOid)
-$oidName = Get-CTOIDObjectName -OID $newOid
-$attributes['msPKI-Cert-Template-OID'] = $newOid
-$attributes['msPKI-Template-Schema-Version'] = $schemaVersion
-$attributes['msPKI-Template-Minor-Revision'] = 0
-$attributes['revision'] = 1
-
+$attributes['msPKI-Template-Schema-Version']=$schemaVersion
+$comContext=[pscustomobject]@{DC=$DC;ConfigurationDN=$configNC;TemplateContainer=$templateContainer;OIDContainer=$oidContainer}
+$plan=New-CTComPlan -Attributes $attributes -Name $Name -DisplayName $DisplayName -Security $finalSecurity -Context $comContext
 Write-Verbose "Prepared $Name; schema $schemaVersion; $ProviderCategory; $Algorithm $MinimumKeySize; validity $($validity.TotalDays) days."
 $createApproved = $PSCmdlet.ShouldProcess($targetDN, 'Create OID and certificate template, apply settings and source permissions')
 if (-not $createApproved) {
@@ -730,50 +707,12 @@ if (-not $createApproved) {
     return
 }
 
-$createdOid = $null
-$createdTemplate = $null
-try {
-    $createdOid = New-ADObject -Server $DC -Name $oidName -Path $oidContainer `
-        -Type 'msPKI-Enterprise-Oid' -DisplayName $DisplayName `
-        -OtherAttributes @{'msPKI-Cert-Template-OID'=$newOid; 'flags'=1} -PassThru -Confirm:$false
-    $createdTemplate = New-ADObject -Server $DC -Name $Name -Path $templateContainer `
-        -Type 'pKICertificateTemplate' -DisplayName $DisplayName `
-        -OtherAttributes $attributes -PassThru -Confirm:$false
-
-    $targetEntry = Open-TemplateEntry $targetDN
-    try {
-        $targetSecurity = $targetEntry.PSBase.ObjectSecurity
-        $targetSecurity.SetSecurityDescriptorSddlForm($finalSddl, $accessSection)
-        $targetEntry.PSBase.ObjectSecurity = $targetSecurity
-        $targetEntry.PSBase.CommitChanges()
-        $targetEntry.PSBase.RefreshCache(@('ntSecurityDescriptor'))
-        $savedSecurity = $targetEntry.PSBase.ObjectSecurity
-        $savedSddl = $savedSecurity.GetSecurityDescriptorSddlForm($accessSection)
-        if (-not (Test-TemplateDacl -Expected $finalSecurity -Actual $savedSecurity)) {
-            throw 'Saved DACL differs from the prepared permissions. See Expected DACL and Saved DACL in verbose output.'
-        }
-    }
-    finally { $targetEntry.PSBase.Dispose() }
-
-    $saved = Get-ADObject -Server $DC -Identity $createdTemplate.ObjectGUID -Properties *
-    # Check all settings written, comparing binary values and unordered multi-values.
-    foreach ($attribute in $attributes.Keys) {
-        $expected = $attributes[$attribute]
-        $actual = Get-AttributeValue $saved $attribute
-        if ($expected -is [byte[]]) {
-            $matches = [Convert]::ToBase64String($expected) -ceq [Convert]::ToBase64String([byte[]]$actual)
-        }
-        else {
-            $expectedStrings = @(Get-StringValues $expected | Sort-Object)
-            $actualStrings = @(Get-StringValues $actual | Sort-Object)
-            $matches = ($expectedStrings.Count -eq $actualStrings.Count) -and
-                (($expectedStrings -join [char]0) -ceq ($actualStrings -join [char]0))
-        }
-        if (-not $matches) { throw "Read-back verification failed for $attribute." }
-    }
-    if ($saved.DisplayName -cne $DisplayName) { throw 'Display name read-back verification failed.' }
+$committed=Invoke-CTComPlan -Plan $plan
+$saved=$committed.Saved
+$savedSecurity=$committed.Security
+$newOid=$committed.OID
     $result = [PSCustomObject]@{
-        ScriptVersion = '1.2.0'
+        ScriptVersion = '0.2.0-COM'
         Name = $saved.Name
         DisplayName = $saved.DisplayName
         DistinguishedName = $saved.DistinguishedName
@@ -807,21 +746,6 @@ try {
         PublicationError = $null
         PublicationCA = $null
     }
-}
-catch {
-    $failure = $_
-    # These object references were returned by this run's successful creates.
-    if ($null -ne $createdTemplate) {
-        try { Remove-ADObject -Server $DC -Identity $createdTemplate.ObjectGUID -Confirm:$false -ErrorAction Stop }
-        catch { Write-Warning "Template cleanup failed: $($_.Exception.Message). Inspect $targetDN." }
-    }
-    if ($null -ne $createdOid) {
-        try { Remove-ADObject -Server $DC -Identity $createdOid.ObjectGUID -Confirm:$false -ErrorAction Stop }
-        catch { Write-Warning "OID cleanup failed: $($_.Exception.Message). Inspect $($createdOid.DistinguishedName)." }
-    }
-    throw $failure
-}
-
 # Publication is deliberately outside the creation/rollback block.
 # A valid AD template remains available if CA publication fails or is declined.
 if ($Publish) {

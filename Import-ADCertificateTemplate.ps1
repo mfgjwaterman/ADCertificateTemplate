@@ -1,10 +1,12 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 #Requires -RunAsAdministrator
 <#
 .SYNOPSIS
 Imports an exported JSON configuration as a NEW AD certificate template.
 .DESCRIPTION
-Version 1.2.0. Requires the companion .psm1 in the same directory and Windows
+COM candidate 0.2.0. Schema 4 is blocked; unsupported RA/archival/policy fields fail before writes.
+Original v1.0 JSON and existing permission/publication parameters are retained.
+Version 1.2.0 source: Requires the companion .psm1 in the same directory and Windows
 PowerShell 5.1. Never overwrites templates; always creates a new OID registration.
 Raw configuration values (including binary durations and crypto settings) are
 retained. Identity, AD system fields, revision, minor revision and publication
@@ -132,50 +134,21 @@ if ($attributes.ContainsKey('msPKI-Supersede-Templates')) {
     }
 }
 Assert-CTPolicyDependencies -Context $context -Attributes $attributes
-$identity = New-CTIdentity $context
-# Never reuse the original template identity or revision counters.
-$attributes['flags'] = [int]$attributes['flags'] -band (-bnot 0x00010000)
-$attributes['msPKI-Cert-Template-OID'] = $identity.OID
-$attributes['revision'] = 1
-$attributes['msPKI-Template-Minor-Revision'] = 0
+$plan=New-CTComPlan -Attributes $attributes -Name $Name -DisplayName $DisplayName -Security $security -Context $context
 $targetDN = "CN=$Name,$($context.TemplateContainer)"
 Write-Verbose "Prepared import '$Name'; permission mode $PermissionMode; a fresh template OID will be assigned."
 if (-not $PSCmdlet.ShouldProcess($targetDN,'Import configuration as a new template and OID; apply and verify permissions')) {
     if ($Publish -and $WhatIfPreference) { $null = $PSCmdlet.ShouldProcess($ca.Config,"Publish imported template $Name") }
     return
 }
-$createdOID = $null
-$createdTemplate = $null
-try {
-    $createdOID = New-ADObject -Server $context.DC -Name $identity.ObjectName -Path $context.OIDContainer `
-        -Type 'msPKI-Enterprise-Oid' -DisplayName $DisplayName `
-        -OtherAttributes @{'msPKI-Cert-Template-OID'=$identity.OID; 'flags'=1} -PassThru -Confirm:$false -ErrorAction Stop
-    $createdTemplate = New-ADObject -Server $context.DC -Name $Name -Path $context.TemplateContainer `
-        -Type pKICertificateTemplate -DisplayName $DisplayName -OtherAttributes $attributes `
-        -PassThru -Confirm:$false -ErrorAction Stop
-    $entry = [System.DirectoryServices.DirectoryEntry]::new("LDAP://$($context.DC)/$targetDN")
-    try {
-        $entry.PSBase.Options.SecurityMasks = [System.DirectoryServices.SecurityMasks]::Dacl
-        $entry.PSBase.RefreshCache(@('ntSecurityDescriptor'))
-        $targetSecurity = $entry.PSBase.ObjectSecurity
-        $targetSecurity.SetSecurityDescriptorBinaryForm($security.GetSecurityDescriptorBinaryForm(),
-            [System.Security.AccessControl.AccessControlSections]::Access)
-        $entry.PSBase.ObjectSecurity = $targetSecurity
-        $entry.PSBase.CommitChanges()
-    }
-    finally { $entry.PSBase.Dispose() }
-    $savedSecurity = Get-CTSecurity -Context $context -DistinguishedName $targetDN
-    if (-not (Test-CTDacl -Expected $security -Actual $savedSecurity)) { throw 'Imported DACL verification failed. See verbose output.' }
-    $saved = Get-CTTemplate -Context $context -Name $Name
-    foreach ($attribute in $attributes.Keys) {
-        if (-not (Test-CTAttribute -Expected $attributes[$attribute] -Actual (Get-CTProperty $saved $attribute))) {
-            throw "Read-back verification failed for $attribute."
-        }
-    }
-    if ($saved.DisplayName -cne $DisplayName) { throw 'Display name verification failed.' }
+$committed=Invoke-CTComPlan -Plan $plan
+$saved=$committed.Saved
+$savedSecurity=$committed.Security
+$identity=[pscustomobject]@{OID=$committed.OID}
+$attributes=$plan.Expected
     $crypto = Get-CTCryptography -Attributes $attributes
     $result = [PSCustomObject]@{
-        ImporterVersion = '1.2.0'
+        ImporterVersion = '0.2.0-COM'
         Name = $saved.Name
         DisplayName = $saved.DisplayName
         DomainController = $context.DC
@@ -197,19 +170,6 @@ try {
         PublicationError = $null
         PublicationCA = $null
     }
-}
-catch {
-    $failure = $_
-    if ($null -ne $createdTemplate) {
-        try { Remove-ADObject -Server $context.DC -Identity $createdTemplate.ObjectGUID -Confirm:$false -ErrorAction Stop }
-        catch { Write-Warning "Template cleanup failed: $targetDN. $($_.Exception.Message)" }
-    }
-    if ($null -ne $createdOID) {
-        try { Remove-ADObject -Server $context.DC -Identity $createdOID.ObjectGUID -Confirm:$false -ErrorAction Stop }
-        catch { Write-Warning "OID cleanup failed: $($createdOID.DistinguishedName). $($_.Exception.Message)" }
-    }
-    throw $failure
-}
 if ($Publish) {
     $result.PublicationCA = $ca.Config
     $result.PublicationStatus = 'Skipped'
