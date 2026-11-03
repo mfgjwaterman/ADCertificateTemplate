@@ -4,12 +4,12 @@
 .SYNOPSIS
 Creates an RSA, ECDSA or ECDH certificate template from a version 1/2 RSA source.
 .DESCRIPTION
-Release 2.1.0, derived from version 1.2.0. Native CertEnroll (schema 2/3) or certca (schema 4 KSP) creates
+Release 2.2.0, derived from version 1.2.0. Native CertEnroll (schema 2/3) or certca (schema 4 KSP) creates
 a fresh OID registration and template. Copies the source
 DACL and its inheritance setting, and applies the selected settings. Never overwrites an existing template. With -Publish, publishes on the LOCAL
 enterprise CA after successful creation and verification.
 
-Requires an elevated Windows PowerShell 5.1 session, domain connectivity, and delegated
+Requires an elevated 64-bit Windows PowerShell 5.1 or PowerShell 7 session on Windows, domain connectivity, and delegated
 permissions to create OID/template objects and write the template DACL.
 Missing ActiveDirectory management tools are installed automatically using
 RSAT-AD-PowerShell on Server or RSAT capability on Windows clients.
@@ -28,9 +28,10 @@ application interoperability must be validated separately.
 Provider names are not checked against the local machine: the enrollment
 client, not this management machine, must have the provider installed.
 
-Modern compatibility selects schema 4 and the experimental native certca route.
-This RC limits schema 4 to RSA3072/4096 and ECDSA/ECDH P-256/P-384 with
-Microsoft Software KSP. Select pre-2012 compatibility for the existing COM scope.
+Modern compatibility selects schema 4 and the native certca route.
+Software KSP supports RSA3072/4096 and ECDSA/ECDH P-256/P-384. Lists containing
+Platform KSP require nonexportable RSA2048/3072/4096; TPM capabilities vary.
+Explicitly select supported providers. Pre-2012 compatibility uses the COM scope.
 Defaults: CA 2012 R2, recipient Windows 10/Server 2016, KSP, RSA 3072,
 SHA256, any provider, one year (365 days), subject supplied in request,
 approval off, key export off. Source renewal period and policies are retained
@@ -156,7 +157,7 @@ $settings = @{
 .EXAMPLE
 .\New-ADCertificateTemplate.ps1 -Name MWMultiSANUser01 -DisplayName 'MW Multi SAN User 01' -SourceTemplate User -SubjectNameMode ActiveDirectory -SubjectNameFormat 'Common name' -SubjectAlternativeName UPN,'E-mail name' -EnrollmentGroup 'GG-T0-Admins' -Publish
 .NOTES
-Version: 2.1.0
+Version: 2.2.0
 Use Get-Help -Full for parameters and examples. Without -Publish: creation only.
 RC: schema 4 native certca; schema 2/3 COM. Validate in a lab. No silent downgrade. PG support confirmation pending.
 Original AnyAvailable provider default is retained; select Software KSP explicitly for schema 4.
@@ -365,9 +366,11 @@ function Open-TemplateEntry {
 }
 
 # This release uses native Windows PowerShell RSAT/ServerManager modules.
-if ($PSVersionTable.PSEdition -ne 'Desktop') {
-    throw 'Run this version in elevated Windows PowerShell 5.1 (powershell.exe).'
-}
+if ($env:OS -ne 'Windows_NT' -or -not [Environment]::Is64BitProcess -or
+        -not (($PSVersionTable.PSEdition -eq 'Desktop' -and $PSVersionTable.PSVersion -ge [version]'5.1') -or
+              ($PSVersionTable.PSEdition -eq 'Core' -and $PSVersionTable.PSVersion.Major -ge 7))) {
+        throw 'Use elevated 64-bit Windows PowerShell 5.1 or PowerShell 7 on Windows.'
+    }
 
 # Pass the script cmdlet explicitly so installation also honors -WhatIf/-Confirm.
 function Ensure-ManagementModule {
@@ -712,7 +715,7 @@ $saved=$committed.Saved
 $savedSecurity=$committed.Security
 $newOid=$committed.OID
     $result = [PSCustomObject]@{
-        ScriptVersion = '2.1.0'
+        ScriptVersion = '2.2.0'
         Backend = $plan.Backend
         Name = $saved.Name
         DisplayName = $saved.DisplayName

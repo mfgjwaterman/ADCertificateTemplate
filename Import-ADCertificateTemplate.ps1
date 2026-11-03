@@ -4,7 +4,7 @@
 .SYNOPSIS
 Imports an exported JSON configuration as a NEW AD certificate template.
 .DESCRIPTION
-Release 2.1.0. Schema 4 KSP uses an experimental native certca backend; schema 2/3 retain COM. Unsupported RA/archival/policy fields fail before writes.
+Release 2.2.0. Schema 4 KSP uses a native certca backend; schema 2/3 retain COM. Unsupported RA/archival/policy fields fail before writes.
 Original v1.0 JSON and existing permission/publication parameters are retained.
 Version 1.2.0 source: Requires the companion .psm1 in the same directory and Windows
 PowerShell 5.1. Never overwrites templates; always creates a new OID registration.
@@ -148,7 +148,7 @@ $identity=[pscustomobject]@{OID=$committed.OID}
 $attributes=$plan.Expected
     $crypto = Get-CTCryptography -Attributes $attributes
     $result = [PSCustomObject]@{
-        ImporterVersion = '2.1.0'
+        ImporterVersion = '2.2.0'
         Backend = $plan.Backend
         Name = $saved.Name
         DisplayName = $saved.DisplayName

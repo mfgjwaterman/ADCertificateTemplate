@@ -4,12 +4,12 @@
 .SYNOPSIS
 Exports a custom AD CS certificate template to a typed, reviewable JSON file.
 .DESCRIPTION
-Release 2.1.0, retaining the version 1.2.0 export format. Export scope: custom schema 2/3/4 RSA and schema 3/4 ECDSA/ECDH P-256/P-384/P-521 templates, including those
+Release 2.2.0, retaining the version 1.2.0 export format. Export scope: custom schema 2/3/4 RSA and schema 3/4 ECDSA/ECDH P-256/P-384/P-521 templates, including those
 created with New-ADCertificateTemplate. Exports configuration and a DACL snapshot;
 no certificates/private keys and no CA publication state. Source identity/OID
 and revisions are metadata only. Unknown populated PKI attributes cause a stop.
 Export support does not imply import support: schema-4 native RC scope is narrower than schema 2/3.
-The companion .psm1 must be in the same directory. Use Windows PowerShell 5.1.
+The companion .psm1 must be in the same directory. Use 64-bit Windows PowerShell 5.1 or PowerShell 7 on Windows.
 Missing AD tools can be installed automatically. WhatIf never installs/writes.
 .PARAMETER TemplateName
 Internal template name in AD, not its display name.
@@ -56,7 +56,7 @@ $crypto = Get-CTCryptography -Attributes $decoded
 $configuration = [ordered]@{
     Format = 'ADCertificateTemplate.Configuration'
     FormatVersion = '1.0'
-    ExporterVersion = '2.1.0'
+    ExporterVersion = '2.2.0'
     ExportedAtUtc = [datetime]::UtcNow.ToString('o')
     Source = [ordered]@{
         Name = $template.Name
@@ -96,7 +96,7 @@ try {
 }
 finally { $stream.Dispose() }
 [PSCustomObject]@{
-    ExporterVersion = '2.1.0'
+    ExporterVersion = '2.2.0'
     Template = $template.Name
     Path = $fullPath
     SHA256 = (Get-FileHash -LiteralPath $fullPath -Algorithm SHA256).Hash
