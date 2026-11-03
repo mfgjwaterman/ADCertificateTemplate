@@ -4,7 +4,7 @@
 .SYNOPSIS
 Creates an RSA, ECDSA or ECDH certificate template from a version 1/2 RSA source.
 .DESCRIPTION
-COM candidate 0.2.0, derived from version 1.2.0. Native CertEnroll creates
+Release 2.1.0, derived from version 1.2.0. Native CertEnroll (schema 2/3) or certca (schema 4 KSP) creates
 a fresh OID registration and template. Copies the source
 DACL and its inheritance setting, and applies the selected settings. Never overwrites an existing template. With -Publish, publishes on the LOCAL
 enterprise CA after successful creation and verification.
@@ -28,9 +28,9 @@ application interoperability must be validated separately.
 Provider names are not checked against the local machine: the enrollment
 client, not this management machine, must have the provider installed.
 
-Schema 4 creation is blocked in this COM candidate. Explicitly select pre-2012
-CA/recipient compatibility for schema 3 KSP or schema 2 legacy creation. The
-retained defaults below request schema 4 and therefore fail before AD writes.
+Modern compatibility selects schema 4 and the experimental native certca route.
+This RC limits schema 4 to RSA3072/4096 and ECDSA/ECDH P-256/P-384 with
+Microsoft Software KSP. Select pre-2012 compatibility for the existing COM scope.
 Defaults: CA 2012 R2, recipient Windows 10/Server 2016, KSP, RSA 3072,
 SHA256, any provider, one year (365 days), subject supplied in request,
 approval off, key export off. Source renewal period and policies are retained
@@ -156,10 +156,10 @@ $settings = @{
 .EXAMPLE
 .\New-ADCertificateTemplate.ps1 -Name MWMultiSANUser01 -DisplayName 'MW Multi SAN User 01' -SourceTemplate User -SubjectNameMode ActiveDirectory -SubjectNameFormat 'Common name' -SubjectAlternativeName UPN,'E-mail name' -EnrollmentGroup 'GG-T0-Admins' -Publish
 .NOTES
-Version: 0.2.0-COM
+Version: 2.1.0
 Use Get-Help -Full for parameters and examples. Without -Publish: creation only.
-COM candidate: validate UI/enrollment in a lab. Schema4 is blocked; explicitly choose pre-2012 compatibility. No silent downgrade.
-Original defaults are retained, so the default modern compatibility is rejected.
+RC: schema 4 native certca; schema 2/3 COM. Validate in a lab. No silent downgrade. PG support confirmation pending.
+Original AnyAvailable provider default is retained; select Software KSP explicitly for schema 4.
 Unsupported RA/archival and certificate-policy settings are rejected before writes.
 #>
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
@@ -712,7 +712,8 @@ $saved=$committed.Saved
 $savedSecurity=$committed.Security
 $newOid=$committed.OID
     $result = [PSCustomObject]@{
-        ScriptVersion = '0.2.0-COM'
+        ScriptVersion = '2.1.0'
+        Backend = $plan.Backend
         Name = $saved.Name
         DisplayName = $saved.DisplayName
         DistinguishedName = $saved.DistinguishedName

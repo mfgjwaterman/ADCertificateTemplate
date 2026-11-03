@@ -1,5 +1,5 @@
 ﻿#Requires -Version 5.1
-# Shared helpers for Export/Import-ADCertificateTemplate, version 1.2.0.
+# Shared helpers, 2.1.0. Schema 2/3 COM; schema 4 experimental native certca backend.
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.DirectoryServices -ErrorAction Stop
@@ -629,9 +629,7 @@ function New-CTComPlan {
     if ($Name -notmatch '^[A-Za-z][A-Za-z0-9_-]{0,63}$') {throw 'Invalid destination name.'}
     if ([string]::IsNullOrWhiteSpace($DisplayName)) {throw 'Empty display name.'}
     Assert-CTConfiguration $Attributes
-    if ([int]$Attributes['msPKI-Template-Schema-Version'] -eq 4) {
-        throw 'Schema 4 is blocked in the COM candidate due to the reproduced crypto-reset defect. No silent schema downgrade is performed. For creation explicitly select pre-2012 compatibility.'
-    }
+    $nativeSchema4=([int]$Attributes['msPKI-Template-Schema-Version'] -eq 4)
     $expected=@{}
     foreach ($key in $Attributes.Keys) {$expected[$key]=$Attributes[$key]}
     foreach ($identity in @('msPKI-Cert-Template-OID','revision','msPKI-Template-Minor-Revision')) {$expected.Remove($identity)}
@@ -654,7 +652,7 @@ function New-CTComPlan {
     Assert-CTPolicyDependencies -Context $Context -Attributes $expected
     $crypto=Get-CTCryptography $expected
     if ($crypto.IsLegacy -and [int]$expected['msPKI-Template-Schema-Version'] -ne 2) {throw 'Legacy CSP requires schema 2 in this candidate.'}
-    if (-not $crypto.IsLegacy -and [int]$expected['msPKI-Template-Schema-Version'] -ne 3) {throw 'KSP requires schema 3 in this candidate.'}
+    if (-not $crypto.IsLegacy -and [int]$expected['msPKI-Template-Schema-Version'] -notin 3,4) {throw 'KSP requires schema 3 or 4.'}
     $algorithmOid='1.2.840.113549.1.1.1'
     if (-not $crypto.IsLegacy) {
         if ($crypto.Algorithm -match '^ECD(SA|H)_P(256|384|521)$') {
@@ -754,7 +752,16 @@ function New-CTComPlan {
         $xml.SelectSingleNode('//p:oID[p:oIDReferenceID="6"]/p:value',$ns).InnerText=$hashOids[$crypto.RequestHash]
         $xml.SelectSingleNode('//p:oID[p:oIDReferenceID="6"]/p:defaultName',$ns).InnerText=$crypto.RequestHash
     }
-    $plan=[pscustomobject]@{Name=$Name;DisplayName=$DisplayName;Context=$Context;Expected=$expected;Xml=$xml.OuterXml;Security=$Security;Crypto=$crypto}
+    $backend=if ($nativeSchema4) {'NativeCertCa'} else {'CertEnrollCOM'}
+    $plan=[pscustomobject]@{Name=$Name;DisplayName=$DisplayName;Context=$Context;Expected=$expected;Xml=$xml.OuterXml;Security=$Security;Crypto=$crypto;Backend=$backend;NativeBaseline=$null}
+    if ($nativeSchema4) {
+        Assert-CTNativeScope -Plan $plan
+        Initialize-CTNativeBackend
+        $baseline=Get-CTTemplate -Context $Context -Name 'WebServer'
+        if ([int]$baseline.'msPKI-Template-Schema-Version' -ne 1) {throw 'Native RC requires the built-in schema-1 WebServer backend baseline.'}
+        $plan.NativeBaseline=[pscustomobject]@{Guid=$baseline.ObjectGUID;OID=[string]$baseline.'msPKI-Cert-Template-OID';USN=[string]$baseline.uSNChanged}
+        [CTNativeBackendRc2]::Preflight($Context.DC,$plan.NativeBaseline.OID)
+    }
     # Validate the prepared in-memory COM input before user approval or directory writes.
     $objects=Open-CTComPlan $plan
     try {
@@ -811,6 +818,9 @@ function Remove-CTComOwned {
 function Invoke-CTComPlan {
     [CmdletBinding()]
     param([Parameter(Mandatory)]$Plan,[switch]$InjectVerificationFailure)
+    if ((Get-CTProperty $Plan 'Backend') -eq 'NativeCertCa') {
+        return Invoke-CTNativePlan -Plan $Plan -InjectVerificationFailure:$InjectVerificationFailure
+    }
     $c=$Plan.Context
     if (Get-CTTemplate -Context $c -Name $Plan.Name -Optional) {throw 'Destination appeared after preparation; refusing Commit.'}
     $beforeOids=@(Get-ADObject -Server $c.DC -SearchBase $c.OIDContainer -SearchScope OneLevel -Filter *)
@@ -848,6 +858,144 @@ function Invoke-CTComPlan {
         throw $failure
     }
     finally {Close-CTComPlan $o}
+}
+
+
+
+function Initialize-CTNativeBackend {
+    if (-not ('CTNativeBackendRc2' -as [type])) {
+        $path=Join-Path $PSScriptRoot 'ADCertificateTemplate.Native.cs'
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {throw 'Missing companion ADCertificateTemplate.Native.cs.'}
+        Add-Type -Path $path -ErrorAction Stop
+    }
+}
+
+function Assert-CTNativeScope {
+    param($Plan)
+    $a=$Plan.Expected;$crypto=$Plan.Crypto
+    if ($crypto.IsLegacy) {throw 'Schema 4 native RC requires a KSP; schema-4 legacy CSP is outside RC scope.'}
+    if ($crypto.Algorithm -notin 'RSA','ECDSA_P256','ECDSA_P384','ECDH_P256','ECDH_P384') {
+        throw 'Schema 4 native RC supports RSA and ECDSA/ECDH P-256/P-384 only. P-521 still uses schema 3.'
+    }
+    if ($crypto.Algorithm -eq 'RSA' -and [int]$a['msPKI-Minimal-Key-Size'] -notin 3072,4096) {
+        throw 'Schema 4 native RC limits RSA to 3072 or 4096 bits.'
+    }
+    if ($crypto.RequestHash -notin 'SHA256','SHA384','SHA512') {throw 'Schema 4 native RC requires SHA256/SHA384/SHA512.'}
+    [uint32]$usage=0
+    if (-not [uint32]::TryParse($crypto.CngKeyUsage,[ref]$usage)) {throw 'CNG usage exceeds UInt32.'}
+    if ($crypto.Algorithm -eq 'RSA' -and $usage -notin 3,16777215) {throw 'Schema 4 RSA CNG usage must be 3 or 16777215.'}
+    $providers=@(Get-CTStrings $a['pKIDefaultCSPs'])
+    if ($providers.Count -ne 1 -or $providers[0] -cne '1,Microsoft Software Key Storage Provider') {
+        throw 'Schema 4 native RC requires exactly Microsoft Software Key Storage Provider; any/multiple/other providers remain schema-2/3 scope.'
+    }
+    # Only known custom/built-in general bits plus the existing low word are serialized.
+    if (([int]$a['flags'] -band (-bnot 0x0003FFFF)) -ne 0) {throw 'Unsupported schema-4 general flag bits.'}
+    # Clone is a mutation: all unsupported settings are rejected above, before it is called.
+}
+
+function Assert-CTNativeOidCleanup {
+    param([object[]]$Remaining,$Owned,[object[]]$References)
+    if ($Remaining.Count -ne 1 -or $Remaining[0].ObjectGUID -ne $Owned.OidGuid -or
+        [string]$Remaining[0].uSNChanged -ne $Owned.OidUSN -or [int]$Remaining[0].flags -ne 1) {
+        throw 'OID cleanup withheld: identity, USN or template OID type changed.'
+    }
+    if ($References.Count) {throw 'OID cleanup withheld: another template references the OID.'}
+}
+
+function Remove-CTNativeOwned {
+    param($Plan,$Owned)
+    $c=$Plan.Context
+    $current=Get-CTTemplate -Context $c -Name $Plan.Name
+    if ($current.ObjectGUID -ne $Owned.TemplateGuid -or
+        [string]$current.'msPKI-Cert-Template-OID' -cne $Owned.OID -or
+        [string]$current.uSNChanged -ne $Owned.TemplateUSN) {throw 'Cleanup withheld: template identity or USN changed.'}
+    $oid=Get-ADObject -Server $c.DC -Identity $Owned.OidGuid -Properties msPKI-Cert-Template-OID,uSNChanged
+    if ([string]$oid.'msPKI-Cert-Template-OID' -cne $Owned.OID -or [string]$oid.uSNChanged -ne $Owned.OidUSN) {
+        throw 'Cleanup withheld: OID identity or USN changed.'
+    }
+    $cas=@(Get-ADObject -Server $c.DC -SearchBase "CN=Enrollment Services,CN=Public Key Services,CN=Services,$($c.ConfigurationDN)" -LDAPFilter '(objectClass=pKIEnrollmentService)' -Properties certificateTemplates |
+        Where-Object {$_.certificateTemplates -contains $Plan.Name})
+    if ($cas.Count) {throw 'Cleanup withheld: template is published.'}
+    [CTNativeBackendRc2]::DeleteOwned($c.DC,$Plan.Name,$Owned.OID)
+    if (Get-CTTemplate -Context $c -Name $Plan.Name -Optional) {throw 'Native cleanup left a template.'}
+    # CADeleteCertTypeEx removed only the template in the Server 2025 RC1 test.
+    # OID registration deletion is a separate API operation; re-establish ownership.
+    $remaining=@(Get-ADObject -Server $c.DC -SearchBase $c.OIDContainer -SearchScope OneLevel -LDAPFilter "(msPKI-Cert-Template-OID=$($Owned.OID))" -Properties uSNChanged,flags)
+    if ($remaining.Count) {
+        $references=@(Get-ADObject -Server $c.DC -SearchBase $c.TemplateContainer -SearchScope OneLevel -LDAPFilter "(msPKI-Cert-Template-OID=$($Owned.OID))")
+        Assert-CTNativeOidCleanup -Remaining $remaining -Owned $Owned -References $references
+        [CTNativeBackendRc2]::DeleteOwnedOid($c.DC,$Owned.OID)
+    }
+    if (@(Get-ADObject -Server $c.DC -SearchBase $c.OIDContainer -SearchScope OneLevel -LDAPFilter "(msPKI-Cert-Template-OID=$($Owned.OID))").Count) {throw 'Native cleanup left an OID object after separate OID deletion.'}
+}
+
+function Invoke-CTNativePlan {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Plan,[switch]$InjectVerificationFailure)
+    $c=$Plan.Context;$a=$Plan.Expected;$crypto=$Plan.Crypto
+    Assert-CTConfiguration $a
+    Assert-CTNativeScope $Plan
+    Initialize-CTNativeBackend
+    if (Get-CTTemplate -Context $c -Name $Plan.Name -Optional) {throw 'Destination appeared after preparation; refusing native clone.'}
+    $displayName=$Plan.DisplayName
+    if (@(Get-ADObject -Server $c.DC -SearchBase $c.TemplateContainer -SearchScope OneLevel -Filter {displayName -eq $displayName}).Count) {
+        throw 'Destination display name appeared after preparation.'
+    }
+    Assert-CTPolicyDependencies -Context $c -Attributes $a
+    foreach ($dependency in @(Get-CTStrings $a['msPKI-Supersede-Templates'])) {$null=Get-CTTemplate -Context $c -Name $dependency}
+    $baseline=Get-CTTemplate -Context $c -Name 'WebServer'
+    if ($baseline.ObjectGUID -ne $Plan.NativeBaseline.Guid -or [string]$baseline.uSNChanged -ne $Plan.NativeBaseline.USN -or
+        [string]$baseline.'msPKI-Cert-Template-OID' -cne $Plan.NativeBaseline.OID) {throw 'Native baseline changed after preparation.'}
+    $beforeOids=@(Get-ADObject -Server $c.DC -SearchBase $c.OIDContainer -SearchScope OneLevel -Filter *)
+    $owned=$null;$native=$null
+    try {
+        $native=[CTNativeBackendRc2]::Run($c.DC,$Plan.Name,$Plan.DisplayName,$Plan.NativeBaseline.OID,
+            $crypto.Algorithm,[uint32]$a['msPKI-Minimal-Key-Size'],$crypto.RequestHash,
+            [uint32]$a['pKIDefaultKeySpec'],[uint32]$crypto.CngKeyUsage,
+            [uint32](ConvertTo-CTComUnsigned ([int]$a['msPKI-Private-Key-Flag'])),
+            [uint32](ConvertTo-CTComUnsigned ([int]$a['msPKI-Enrollment-Flag'])),
+            [uint32](ConvertTo-CTComUnsigned ([int]$a['msPKI-Certificate-Name-Flag'])),
+            [uint32](ConvertTo-CTComUnsigned ([int]$a['flags'])),
+            [BitConverter]::ToInt64([byte[]]$a['pKIExpirationPeriod'],0),
+            [BitConverter]::ToInt64([byte[]]$a['pKIOverlapPeriod'],0),
+            [byte[]]$a['pKIKeyUsage'],$Plan.Security.GetSecurityDescriptorBinaryForm(),
+            [string[]]@('Microsoft Software Key Storage Provider'),
+            [string[]]@(Get-CTStrings $a['pKIExtendedKeyUsage']),
+            [string[]]@(Get-CTStrings $a['msPKI-Certificate-Application-Policy']),
+            [string[]]@(Get-CTStrings $a['msPKI-Supersede-Templates']))
+        if ($native.Error -or -not $native.SaveReturned) {throw "Native failure at $($native.Stage): $($native.Error)"}
+        $saved=Get-CTTemplate -Context $c -Name $Plan.Name
+        $oid=[string]$saved.'msPKI-Cert-Template-OID'
+        if ($oid -notmatch '^[0-2](\.[0-9]+)+$' -or $oid -cne $native.NativeOID) {throw 'Cannot establish generated native OID identity.'}
+        $oids=@(Get-ADObject -Server $c.DC -SearchBase $c.OIDContainer -SearchScope OneLevel -LDAPFilter "(msPKI-Cert-Template-OID=$oid)" -Properties uSNChanged)
+        if ($oids.Count -ne 1 -or $oids[0].ObjectGUID -in @($beforeOids.ObjectGUID)) {throw 'Cannot establish ownership of generated native OID object.'}
+        $owned=[pscustomobject]@{TemplateGuid=$saved.ObjectGUID;TemplateUSN=[string]$saved.uSNChanged;OID=$oid;OidGuid=$oids[0].ObjectGUID;OidUSN=[string]$oids[0].uSNChanged}
+        if ($InjectVerificationFailure) {throw 'LAB_INJECTED_POSTCOMMIT_VERIFICATION_FAILURE'}
+        $sourceAfter=Get-ADObject -Server $c.DC -Identity $Plan.NativeBaseline.Guid -Properties uSNChanged
+        if ([string]$sourceAfter.uSNChanged -ne $Plan.NativeBaseline.USN) {throw 'Native backend baseline changed during execution.'}
+        $security=Get-CTSecurity -Context $c -DistinguishedName $saved.DistinguishedName
+        if (-not (Test-CTDacl -Expected $Plan.Security -Actual $security)) {throw 'Native DACL/protection read-back mismatch.'}
+        foreach ($key in $a.Keys) {
+            if (-not (Test-CTComValue -Name $key -Expected $a[$key] -Actual (Get-CTProperty $saved $key))) {
+                throw "Native read-back mismatch on $($Plan.Name): $key; Expected=[$(@(Get-CTStrings $a[$key]) -join '|')]; Actual=[$(@(Get-CTStrings (Get-CTProperty $saved $key)) -join '|')]"
+            }
+        }
+        # Native clone/save owns revision assignment; do not impose COM's 1/0 on it.
+        if ($saved.DisplayName -cne $Plan.DisplayName -or [int]$saved.revision -lt 1 -or
+            $null -eq (Get-CTProperty $saved 'msPKI-Template-Minor-Revision') -or [int]$saved.'msPKI-Template-Minor-Revision' -lt 0) {throw 'Native display name/revision validation failed.'}
+        return [pscustomobject]@{Saved=$saved;Security=$security;OID=$oid;Owned=$owned;Backend='NativeCertCa';Native=$native}
+    }
+    catch {
+        $failure=$_
+        if ($null -ne $owned) {
+            try {Remove-CTNativeOwned -Plan $Plan -Owned $owned;Write-Warning 'Native verification failed; owned template and OID were removed.'}
+            catch {Write-Warning "Native cleanup failed: $($_.Exception.Message). Inspect $($Plan.Name), OID $($owned.OID)."}
+        } else {
+            $details=if ($null -ne $native) {"Stage=$($native.Stage); generated OID=$($native.NativeOID)"} else {'Native result unavailable.'}
+            Write-Warning "Native operation failed before ownership was established. No blind cleanup. Inspect $($Plan.Name). $details"
+        }
+        throw $failure
+    }
 }
 
 Export-ModuleMember -Function *-CT*

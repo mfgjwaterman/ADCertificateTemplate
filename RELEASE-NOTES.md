@@ -1,40 +1,28 @@
-# ADCertificateTemplate 2.0.0 — 1 November 2026
+# ADCertificateTemplate 2.1.0 — 3 November 2026
 
-Scoped release of the COM implementation validated through rc1/rc2 integration runs and the final RC3 negative checks. This package is prepared for review/distribution. No repository tag, public GitHub release or blog/social publication has been created by this packaging step.
+Adds a scoped schema-4 KSP creation/import route to the existing schema-2/3 CertEnroll COM implementation. Based on repository main commit `dfe95e8` and the tested 2.1.0 RC2 runtime. JSON configuration FormatVersion remains **1.0**.
 
-## Breaking changes from 1.2.0
+## Changes from 2.0.0
 
-- Schema 4 creation/import is rejected; no silent downgrade is performed.
-- Retained modern compatibility defaults request schema 4. Existing calls that rely on those defaults must explicitly select the supported compatibility route.
-- Unsupported serializer configurations fail before save, including archival, RA signatures and issuance policies. Review README.md before migrating.
-- Keep version 1.2.0 available as the previous release; do not mix its module with 2.0.0 commands.
+- Schema 4 KSP uses native certca clone/configure/save. The provider transition runs before final crypto setters, avoiding the late default reset observed in the investigated COM path.
+- New required companion: `ADCertificateTemplate.Native.cs`. Keep it beside the module and commands.
+- Schema-4 scope: Software KSP; RSA3072/4096; ECDSA/ECDH P256/P384; SHA2. Other providers, any-provider, P521 and schema-4 legacy CSP remain rejected. Existing schema-2/3 scope is retained.
+- Shared configuration, original-format portability, DACL verification, collision/dependency checks, WhatIf and optional post-verification publication are retained. Results expose the backend.
+- Native rollback separately removes the owned template and OID registration, guarding identities, USNs, type, template references and publication state. Partial failures before ownership capture remain for inspection.
+- Added native profile/feature tests, integrated publication/enrollment/key-use tests, denied-write tests and isolated publication fault-injection tests.
 
-## Implementation changes
+## Upgrade
 
-- New and Import use a shared in-memory XCEP -> native CertEnroll Commit path. Native COM generates fresh template OIDs.
-- AD reads remain; direct template/OID creation, modification, DACL commits and deletion through AD write APIs are removed from this package. Optional CA publication remains a separate certutil operation.
-- Export retains the original typed JSON format version 1.0. Import creates a new identity, validates supported settings and verifies saved configuration and permissions.
-- Creator EnrollAndAutoenroll requests set flag 0x20 explicitly. Import rejects contradictory explicit Autoenroll ACEs and flags without changing the exported intent silently.
-- Post-save verification failures trigger identity-guarded COM cleanup when ownership is established, followed by absence checks. Partial native Commit recovery is not guaranteed.
+Extract into a separate folder and start a fresh elevated Windows PowerShell 5.1 x64 session. Replace the complete package together, including native C#. The old AnyAvailable provider default is unchanged: select Microsoft Software KSP explicitly with SelectedProviders for schema 4. No automatic downgrade or provider substitution is performed.
 
-## Final validation
+Existing templates, certificates and OID registrations are not migrated or repaired by replacing scripts. Successful lab objects and any previously retained partial objects are not automatically removed.
 
-- Nine crypto/provider profiles: eighteen create/import results, controlled rollback and existing-template snapshot all passed in rc2 R03.
-- Independent MachineDNS and MultiKSP AD feature checks passed, including explicit autoenrollment flags/permissions, provider priorities, supersedence and unchanged existing template/OID snapshots.
-- Creator and importer publication sequences each resulted in an installed machine certificate with a functioning RSA3072 Software KSP private key (requests 109 and 110).
-- Integrated RC3 negative checks: **20 passed, 0 failed**. Template/OID GUID-USN snapshots and CA publication snapshots remained unchanged. The test did not request directory writes or exercise Commit permissions.
+## Validation
 
-## Release preparation
+Create/import, rollback, schema-4 features, schema-2/3 regressions, negative inputs, integrated enrollment/private-key operation, workstation autoenrollment, denied AD writes and injected publication-failure handling were exercised as described in VALIDATION.md. Native creation/import/rollback was tested from Server 2022 and Server 2025; integrated issuing-CA/key-use tests used Server 2025.
 
-- Public release version: 2.0.0. The earlier COM 0.2.0 labels were development labels.
-- The scripts in the release must report 2.0.0 consistently; these Markdown files do not modify script version metadata.
-- Includes Test-COMCandidateNegative.ps1 and completed validation evidence.
-- Updated documentation with completed validation results and the public 2.0.0 release number.
-- Core COM module byte-identical to rc2/rc3. No intended runtime behavior changes; commands differ only in version labels/help from the tested implementation.
-- Final-label packaging checks passed locally; a separate Windows execution of the final version label is not claimed.
+The final 2.1.0 runtime is unchanged from tested RC2 apart from version strings/comments. Test version guards and documentation are updated. The final package receives parsing, C# compilation, offline checks, runtime-freeze comparison and archive/checksum validation; no separate full Windows rerun under the final 2.1.0 label is claimed.
 
-## Scope limits
+## Support and remaining scope
 
-Schema 4 is blocked because of the reproduced native crypto-reset defect. Modern default compatibility selections are retained and therefore fail before writes; explicitly select supported pre-2012 compatibility. No silent downgrade or unsupported-field omission is performed. Private-key archival, RA signatures, issuance policies and other exclusions remain as documented in README.md.
-
-This is not full feature parity with the original direct-AD scripts, a vendor support statement, or proof of every application/OS/provider combination. Keep the original working release separately. See VALIDATION.md for the evidence and its limits.
+Microsoft PG confirmation of the native API support status remains pending. Lab success is not a Microsoft support statement. Actual CA authorization refusal was not tested: publication-failure testing used isolated fault injection in both creator and importer. Approval workflow, PFX export, renewal, cross-forest imports and protocol/trust/revocation behavior remain open, as documented in VALIDATION.md.
